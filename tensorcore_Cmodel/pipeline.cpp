@@ -15,24 +15,37 @@ bool DotProductUnit::can_accept() const { return true; }
 void DotProductUnit::push(const DPInput& in, OTC_Stats& stats) {
     double products[64];
     for (int k = 0; k < cfg_->K; k++) {
-        products[k] = in.a[k] * in.b[k];
+        // fp9 multiply (e5m3)
+        double p = in.a[k] * in.b[k];
+        uint16_t p9_bits = SoftFloat::f64_to_fp9(p);
+        double p9 = SoftFloat::fp9_to_f64(p9_bits);
+
+        // accumulate in 2x fp9 precision: fp13 (e5m7)
+        uint16_t p13_bits = SoftFloat::f64_to_fp13(p9);
+        products[k] = SoftFloat::fp13_to_f64(p13_bits);
         stats.mul_ops++;
     }
 
     int n = cfg_->K;
     while (n > 1) {
         for (int i = 0; i < n / 2; i++) {
-            products[i] = products[2 * i] + products[2 * i + 1];
+            double s = products[2 * i] + products[2 * i + 1];
+            uint16_t s13_bits = SoftFloat::f64_to_fp13(s);
+            products[i] = SoftFloat::fp13_to_f64(s13_bits);
             stats.add_ops++;
         }
         n /= 2;
     }
 
-    double result = products[0] + in.c;
-    stats.add_ops++;
+    // reduce dot product back to fp9
+    uint16_t dot9_bits = SoftFloat::f64_to_fp9(products[0]);
+    double dot9 = SoftFloat::fp9_to_f64(dot9_bits);
 
-    uint32_t fp22_bits = SoftFloat::f64_to_fp22(result);
+    // final accumulation with C in fp22
+    double sum_with_c = dot9 + in.c;
+    uint32_t fp22_bits = SoftFloat::f64_to_fp22(sum_with_c);
     double fp22_val = SoftFloat::fp22_to_f64(fp22_bits);
+    stats.add_ops++;
 
     InFlight entry;
     entry.result = {fp22_val, in.row, in.col};
@@ -136,7 +149,9 @@ void TensorCoreUnit::do_format_conversion() {
         int ei = i % 2;
         uint32_t w = (wi < (int)raw_c_.size()) ? raw_c_[wi] : 0;
         uint16_t half = (w >> (ei * 16)) & 0xFFFF;
-        conv_c_[i] = SoftFloat::fp16_to_f64(half);
+        double c_f64 = SoftFloat::fp16_to_f64(half);
+        uint32_t c_fp22 = SoftFloat::f64_to_fp22(c_f64);
+        conv_c_[i] = SoftFloat::fp22_to_f64(c_fp22);
     }
 
     DT.log(2, "FmtConv done: A[0]=%f A[1]=%f B[0]=%f C[0]=%f", conv_a_[0], total_a > 1 ? conv_a_[1] : 0.0, conv_b_[0],
