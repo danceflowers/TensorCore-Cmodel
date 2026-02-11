@@ -56,12 +56,41 @@ std::vector<uint32_t> pack_ab(const std::vector<double>& vals, int type_ab, int 
         uint32_t packed = 0;
         switch (type_ab) {
             case TYPE_FP8: {
-                uint16_t fp9 = SoftFloat::f64_to_fp9(vals[i]);
-                int s = (fp9 >> 8) & 1, e = (fp9 >> 3) & 0x1F, m = fp9 & 7;
-                if (sub == SUB_FP8E5M2)
-                    packed = (s << 7) | (e << 2) | (m >> 1);
-                else
-                    packed = (s << 7) | ((e & 0xF) << 3) | m;
+                if (sub == SUB_FP8E5M2) {
+                    // FP8 E5M2: s=1, e=5, m=2, bias=15
+                    // Safe to go through FP9(E5M3, bias=15) — same exponent range
+                    uint16_t fp9 = SoftFloat::f64_to_fp9(vals[i]);
+                    int s9 = (fp9 >> 8) & 1, e9 = (fp9 >> 3) & 0x1F, m9 = fp9 & 7;
+                    packed = (s9 << 7) | (e9 << 2) | (m9 >> 1);
+                } else {
+                    // FP8 E4M3 (E4M3FN): s=1, e=4, m=3, bias=7
+                    // Must convert directly — FP9 has bias=15, E4M3 has bias=7!
+                    double v = vals[i];
+                    int s = (v < 0) ? 1 : 0;
+                    double av = fabs(v);
+                    if (std::isnan(v)) {
+                        packed = 0x7F;  // e=15,m=7 → NaN
+                    } else if (av == 0.0) {
+                        packed = (s << 7);
+                    } else {
+                        int exp;
+                        double frac = frexp(av, &exp);
+                        frac *= 2.0; exp--;  // normalise to [1.0, 2.0)
+                        int be = exp + 7;    // bias = 7
+                        int m;
+                        if (be >= 15) {
+                            // Clamp to max finite: e=14, m=7 → 1.875 * 2^7 = 240
+                            packed = (s << 7) | (0x0E << 3) | 0x07;
+                        } else if (be <= 0) {
+                            // Subnormal: value = m/8 * 2^(-6)
+                            m = (int)(av / ldexp(1.0, -9) + 0.5) & 0x07;
+                            packed = (s << 7) | m;
+                        } else {
+                            m = (int)((frac - 1.0) * 8.0 + 0.5) & 0x07;
+                            packed = (s << 7) | (be << 3) | m;
+                        }
+                    }
+                }
                 break;
             }
             case TYPE_FP4: {
@@ -122,6 +151,51 @@ std::vector<double> golden_gemm(const std::vector<double>& a, const std::vector<
                 sum += a[i * K + k] * b[k * N + j];
             }
             d[i * N + j] = sum + c[i * N + j];
+        }
+    }
+    return d;
+}
+
+// Quantized golden: round-trip inputs through pack→unpack to match simulator
+std::vector<double> golden_gemm_quantized(const std::vector<double>& a_raw, const std::vector<double>& b_raw,
+                                           const std::vector<double>& c_raw, int M, int K, int N,
+                                           int type_ab, int type_ab_sub) {
+    // Quantize A and B through the same pack→unpack path as the simulator
+    auto pa = pack_ab(a_raw, type_ab, type_ab_sub);
+    auto pb = pack_ab(b_raw, type_ab, type_ab_sub);
+    auto pc = pack_c_fp16(c_raw);
+
+    int eb = FPConvert::elem_bits(type_ab);
+    int eperw = 32 / eb;
+
+    std::vector<double> a_q(M * K), b_q(K * N), c_q(M * N);
+
+    for (int i = 0; i < M * K; i++) {
+        int wi = i / eperw, ei = i % eperw;
+        uint32_t w = (wi < (int)pa.size()) ? pa[wi] : 0;
+        a_q[i] = FPConvert::elem_to_f64(w, ei, type_ab, type_ab_sub);
+    }
+    for (int i = 0; i < K * N; i++) {
+        int wi = i / eperw, ei = i % eperw;
+        uint32_t w = (wi < (int)pb.size()) ? pb[wi] : 0;
+        b_q[i] = FPConvert::elem_to_f64(w, ei, type_ab, type_ab_sub);
+    }
+    for (int i = 0; i < M * N; i++) {
+        int wi = i / 2, ei = i % 2;
+        uint32_t w = (wi < (int)pc.size()) ? pc[wi] : 0;
+        uint16_t half = (w >> (ei * 16)) & 0xFFFF;
+        c_q[i] = SoftFloat::fp16_to_f64(half);
+    }
+
+    // Compute matmul with quantized inputs in fp64
+    std::vector<double> d(M * N, 0.0);
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            double sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += a_q[i * K + k] * b_q[k * N + j];
+            }
+            d[i * N + j] = sum + c_q[i * N + j];
         }
     }
     return d;
@@ -252,8 +326,13 @@ int main(int argc, char** argv) {
         td = gen_ones(cfg.M, cfg.K, cfg.N);
 
     auto gold = golden_gemm(td.a, td.b, td.c, cfg.M, cfg.K, cfg.N);
-    std::cout << "Golden D (first row): ";
+    auto gold_q = golden_gemm_quantized(td.a, td.b, td.c, cfg.M, cfg.K, cfg.N, cfg.type_ab, cfg.type_ab_sub);
+    std::cout << "Golden D (fp64,  first row): ";
     for (int j = 0; j < std::min(8, cfg.N); j++) std::cout << std::fixed << std::setprecision(4) << gold[j] << " ";
+    if (cfg.N > 8) std::cout << "...";
+    std::cout << "\n";
+    std::cout << "Golden D (quant, first row): ";
+    for (int j = 0; j < std::min(8, cfg.N); j++) std::cout << std::fixed << std::setprecision(4) << gold_q[j] << " ";
     if (cfg.N > 8) std::cout << "...";
     std::cout << "\n";
 
@@ -276,34 +355,35 @@ int main(int argc, char** argv) {
     std::vector<double> result(cfg.M * cfg.N);
     otc_download_f64(dev, result.data(), result.size());
 
-    std::cout << "SimX D  (first row): ";
+    std::cout << "SimX D           (first row): ";
     for (int j = 0; j < std::min(8, cfg.N); j++) std::cout << std::fixed << std::setprecision(4) << result[j] << " ";
     if (cfg.N > 8) std::cout << "...";
     std::cout << "\n";
 
+    // Compare SimX against quantized golden — difference is only FP22 accumulator error
     double rtol, atol;
     switch (cfg.type_ab) {
         case TYPE_FP4:
-            rtol = 0.5;
-            atol = 2.0;
+            rtol = 0.05;
+            atol = 0.01;
             break;
         case TYPE_FP8:
-            rtol = 0.30;
-            atol = 0.50;
+            rtol = 0.05;
+            atol = 0.01;
             break;
         case TYPE_FP16:
-            rtol = 0.01;
-            atol = 0.001;
+            rtol = 0.02;
+            atol = 0.005;
             break;
         default:
-            rtol = 0.30;
-            atol = 0.50;
+            rtol = 0.05;
+            atol = 0.01;
             break;
     }
 
-    bool pass = verify(result, gold, rtol, atol, cfg.M, cfg.N);
-    std::cout << "\nVerification: " << (pass ? "PASSED ✓" : "FAILED ✗") << " (rtol=" << (rtol * 100) << "% atol=" << atol
-              << ")\n\n";
+    bool pass = verify(result, gold_q, rtol, atol, cfg.M, cfg.N);
+    std::cout << "\nVerification (vs quantized golden): " << (pass ? "PASSED ✓" : "FAILED ✗")
+              << " (rtol=" << (rtol * 100) << "% atol=" << atol << ")\n\n";
 
     otc_stats(dev).print(std::cout);
 
@@ -314,7 +394,13 @@ int main(int argc, char** argv) {
             for (int j = 0; j < cfg.N; j++) std::cout << std::setw(8) << std::setprecision(3) << result[i * cfg.N + j];
             std::cout << " ]\n";
         }
-        std::cout << "\n=== Golden Reference ===\n";
+        std::cout << "\n=== Quantized Golden Reference ===\n";
+        for (int i = 0; i < cfg.M; i++) {
+            std::cout << "  [";
+            for (int j = 0; j < cfg.N; j++) std::cout << std::setw(8) << std::setprecision(3) << gold_q[i * cfg.N + j];
+            std::cout << " ]\n";
+        }
+        std::cout << "\n=== FP64 Golden Reference ===\n";
         for (int i = 0; i < cfg.M; i++) {
             std::cout << "  [";
             for (int j = 0; j < cfg.N; j++) std::cout << std::setw(8) << std::setprecision(3) << gold[i * cfg.N + j];
