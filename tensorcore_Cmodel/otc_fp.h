@@ -25,6 +25,8 @@ namespace FPConvert {
 double fp4_to_f64(uint8_t fp4);
 double fp8e5m2_to_f64(uint8_t fp8);
 double fp8e4m3_to_f64(uint8_t fp8);
+uint8_t f64_to_fp8e5m2(double v);
+uint8_t f64_to_fp8e4m3(double v);
 double fp16_to_f64_via_fp9(uint16_t fp16);
 double elem_to_f64(uint32_t word, int elem_idx, int type_ab, int sub);
 int elem_bits(int type_ab);

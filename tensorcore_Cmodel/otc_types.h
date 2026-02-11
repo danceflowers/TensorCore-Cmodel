@@ -26,11 +26,16 @@ struct OTC_Config {
     uint8_t type_ab = TYPE_FP8;
     uint8_t type_ab_sub = SUB_FP8E5M2;
     uint8_t type_cd = TYPE_FP32;
+    uint8_t type_cd_sub = SUB_FP8E5M2;
     bool transpose_b = false;
 
     int mul_latency = 2;
     int add_latency = 2;
     int conv_latency = 1;
+    int dispatch_width = 8;
+    int input_fifo_depth = 8;
+    int output_fifo_depth = 8;
+    int mem_bandwidth_bytes_per_cycle = 32;
 
     int debug_level = 0;
     bool trace_en = false;
@@ -49,6 +54,19 @@ struct OTC_Stats {
     uint64_t add_ops = 0;
     uint64_t matrices_done = 0;
     uint64_t conv_cycles = 0;
+    uint64_t format_active_cycles = 0;
+    uint64_t dispatch_active_cycles = 0;
+    uint64_t input_fifo_stall_cycles = 0;
+    uint64_t output_backpressure_cycles = 0;
+    uint64_t output_fifo_max_occupancy = 0;
+    uint64_t dp_busy_unit_cycles = 0;
+    uint64_t dp_issue_slots = 0;
+    uint64_t total_latency_cycles = 0;
+    uint64_t dram_read_bytes = 0;
+    uint64_t dram_write_bytes = 0;
+    uint64_t batches_enqueued = 0;
+    uint64_t dp_capacity_units = 0;
+    uint64_t peak_bw_bytes_per_cycle = 0;
 
     void print(std::ostream& os) const;
 };
