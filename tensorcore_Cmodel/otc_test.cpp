@@ -99,7 +99,7 @@ std::vector<uint32_t> test_pack_c_fp16(const std::vector<double>& vals) {
     return words;
 }
 
-// Quantized golden: same round-trip as simulator
+// Quantized golden: same precision path as simulator
 std::vector<double> quantized_golden(const std::vector<double>& a, const std::vector<double>& b,
                                       const std::vector<double>& c, int M, int K, int N,
                                       int type_ab, int sub) {
@@ -122,17 +122,56 @@ std::vector<double> quantized_golden(const std::vector<double>& a, const std::ve
     for (int i = 0; i < M * N; i++) {
         int wi = i / 2, ei = i % 2;
         uint32_t w = wi < (int)pc.size() ? pc[wi] : 0;
-        cq[i] = SoftFloat::fp16_to_f64((w >> (ei * 16)) & 0xFFFF);
+        double c16 = SoftFloat::fp16_to_f64((w >> (ei * 16)) & 0xFFFF);
+        cq[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(c16));
     }
 
     std::vector<double> d(M * N, 0.0);
     for (int i = 0; i < M; i++)
         for (int j = 0; j < N; j++) {
-            double sum = 0;
-            for (int k = 0; k < K; k++) sum += aq[i * K + k] * bq[k * N + j];
-            d[i * N + j] = sum + cq[i * N + j];
+            std::vector<double> tree(K);
+            for (int k = 0; k < K; k++) {
+                double p9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(aq[i * K + k] * bq[k * N + j]));
+                tree[k] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(p9));
+            }
+
+            int n = K;
+            while (n > 1) {
+                for (int x = 0; x < n / 2; x++) {
+                    double s13 = tree[2 * x] + tree[2 * x + 1];
+                    tree[x] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(s13));
+                }
+                n /= 2;
+            }
+
+            double dot9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(tree[0]));
+            d[i * N + j] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot9 + cq[i * N + j]));
         }
     return d;
+}
+
+std::vector<double> fp32_golden(const std::vector<double>& a, const std::vector<double>& b, const std::vector<double>& c,
+                                int M, int K, int N) {
+    std::vector<double> d(M * N, 0.0);
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += (float)a[i * K + k] * (float)b[k * N + j];
+            d[i * N + j] = (double)(sum + (float)c[i * N + j]);
+        }
+    }
+    return d;
+}
+
+void print_matrix(const char* tag, const std::vector<double>& m, int R, int C) {
+    printf("%s\n", tag);
+    for (int i = 0; i < R; i++) {
+        printf("  ");
+        for (int j = 0; j < C; j++) {
+            printf("%10.6f ", m[i * C + j]);
+        }
+        printf("\n");
+    }
 }
 
 // Run a single GEMM test, return TestResult
@@ -169,6 +208,14 @@ TestResult run_one_test(const std::string& name, int M, int K, int N,
     std::vector<double> result(M * N);
     otc_download_f64(dev, result.data(), result.size());
     otc_dev_close(dev);
+
+    std::vector<double> gold_fp32;
+    if (M == 8 && K == 8 && N == 8) {
+        gold_fp32 = fp32_golden(a, b, c, M, K, N);
+        printf("\n  [Matrix dump] %s\n", name.c_str());
+        print_matrix("  Result matrix:", result, M, N);
+        print_matrix("  Golden matrix (fp32):", gold_fp32, M, N);
+    }
 
     tr.pass = true; tr.max_err = 0; tr.avg_err = 0; tr.mismatches = 0;
     double sum_err = 0;
@@ -279,7 +326,7 @@ void test_identity_suite() {
 void test_random_suite() {
     printf("\n=== Suite: Random matrices (multiple seeds) ===\n");
     int dims[][3] = {{8,8,8},{4,4,4},{8,4,8},{4,8,4},{16,16,16}};
-    unsigned seeds[] = {42, 123, 256, 999, 1337};
+    unsigned seeds[] = {42, 123, 256, 999, 1337, 2024, 31415, 65535, 77777, 88888};
     for (auto& ts : ALL_TYPES) {
         for (auto& d : dims) {
             for (auto seed : seeds) {

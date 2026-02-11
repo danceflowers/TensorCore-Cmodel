@@ -12,6 +12,9 @@ uint32_t f64_to_fp32(double v);
 double fp9_to_f64(uint16_t bits9);
 uint16_t f64_to_fp9(double v);
 
+double fp13_to_f64(uint16_t bits13);
+uint16_t f64_to_fp13(double v);
+
 double fp22_to_f64(uint32_t bits22);
 uint32_t f64_to_fp22(double v);
 

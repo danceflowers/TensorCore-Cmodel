@@ -184,18 +184,27 @@ std::vector<double> golden_gemm_quantized(const std::vector<double>& a_raw, cons
         int wi = i / 2, ei = i % 2;
         uint32_t w = (wi < (int)pc.size()) ? pc[wi] : 0;
         uint16_t half = (w >> (ei * 16)) & 0xFFFF;
-        c_q[i] = SoftFloat::fp16_to_f64(half);
+        c_q[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(half)));
     }
 
-    // Compute matmul with quantized inputs in fp64
+    // Compute matmul with simulator precision path: fp9 mul -> fp13 tree accumulate -> fp9 -> fp22 + C
     std::vector<double> d(M * N, 0.0);
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
-            double sum = 0;
+            std::vector<double> tree(K);
             for (int k = 0; k < K; k++) {
-                sum += a_q[i * K + k] * b_q[k * N + j];
+                double p9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(a_q[i * K + k] * b_q[k * N + j]));
+                tree[k] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(p9));
             }
-            d[i * N + j] = sum + c_q[i * N + j];
+            int n = K;
+            while (n > 1) {
+                for (int x = 0; x < n / 2; x++) {
+                    tree[x] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(tree[2 * x] + tree[2 * x + 1]));
+                }
+                n /= 2;
+            }
+            double dot9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(tree[0]));
+            d[i * N + j] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot9 + c_q[i * N + j]));
         }
     }
     return d;
