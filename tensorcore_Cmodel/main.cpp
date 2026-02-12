@@ -2,36 +2,18 @@
 #include "otc_driver.h"
 
 struct TestData {
-    std::vector<double> a, b, c;
+    std::vector<double> a;
+    std::vector<double> b;
+    std::vector<double> c;
 };
 
-struct Args {
-    OTC_Config cfg;
-    std::string test = "ones";
-    int batches = 1;
-    int random_runs = 5;
+struct PrecCase {
+    int type_ab;
+    int type_ab_sub;
+    int type_cd;
+    int type_cd_sub;
+    const char* name;
 };
-
-static TestData gen_ones(int M, int K, int N) {
-    TestData t;
-    t.a.assign(M * K, 1.0);
-    t.b.assign(K * N, 1.0);
-    t.c.assign(M * N, 0.0);
-    return t;
-}
-
-static TestData gen_identity(int M, int K, int N) {
-    TestData t;
-    t.a.assign(M * K, 0.0);
-    t.b.assign(K * N, 0.0);
-    t.c.assign(M * N, 0.0);
-    int mn = std::min({M, K, N});
-    for (int i = 0; i < mn; i++) {
-        t.a[i * K + i] = 1.0;
-        t.b[i * N + i] = 1.0;
-    }
-    return t;
-}
 
 static TestData gen_random(int M, int K, int N, unsigned seed) {
     TestData t;
@@ -45,53 +27,18 @@ static TestData gen_random(int M, int K, int N, unsigned seed) {
     return t;
 }
 
-static TestData gen_simple() {
-    TestData t;
-    t.a = {1, 2, 3, 4};
-    t.b = {5, 6, 7, 8};
-    t.c = {0, 0, 0, 0};
-    return t;
-}
-
-static uint8_t quantize_fp8(double v, int sub) {
-    return (sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(v) : FPConvert::f64_to_fp8e5m2(v);
-}
-
-
 static std::vector<uint32_t> pack_ab(const std::vector<double>& vals, int type_ab, int sub) {
     int eb = FPConvert::elem_bits(type_ab);
     int eperw = 32 / eb;
-    int nw = ((int)vals.size() + eperw - 1) / eperw;
-    std::vector<uint32_t> words(nw, 0);
-
+    std::vector<uint32_t> words((vals.size() + eperw - 1) / eperw, 0);
     for (int i = 0; i < (int)vals.size(); i++) {
-        int wi = i / eperw, ei = i % eperw;
+        int wi = i / eperw;
+        int ei = i % eperw;
         uint32_t packed = 0;
         if (type_ab == TYPE_FP8) {
-            packed = quantize_fp8(vals[i], sub);
+            packed = (sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(vals[i]) : FPConvert::f64_to_fp8e5m2(vals[i]);
         } else if (type_ab == TYPE_FP4) {
-            double v = vals[i];
-            int s = (v < 0) ? 1 : 0;
-            double av = fabs(v);
-            int e = 0, m = 0;
-            if (av >= 4.0) {
-                e = 2;
-                m = 1;
-            } else if (av > 0.0) {
-                int exp;
-                double frac = frexp(av, &exp);
-                if (exp <= 0) {
-                    e = 0;
-                    m = (av >= 0.5) ? 1 : 0;
-                } else if (exp >= 3) {
-                    e = 2;
-                    m = 1;
-                } else {
-                    e = exp;
-                    m = (2.0 * frac - 1.0 >= 0.5) ? 1 : 0;
-                }
-            }
-            packed = (s << 3) | (e << 1) | m;
+            packed = (uint32_t)(SoftFloat::f64_to_fp9(vals[i]) >> 5) & 0xF;
         } else {
             packed = SoftFloat::f64_to_fp16(vals[i]);
         }
@@ -101,243 +48,183 @@ static std::vector<uint32_t> pack_ab(const std::vector<double>& vals, int type_a
 }
 
 static std::vector<uint32_t> pack_c_fp16(const std::vector<double>& vals) {
-    int nw = ((int)vals.size() + 1) / 2;
-    std::vector<uint32_t> words(nw, 0);
+    std::vector<uint32_t> words((vals.size() + 1) / 2, 0);
     for (int i = 0; i < (int)vals.size(); i++) {
-        uint16_t h = SoftFloat::f64_to_fp16(vals[i]);
-        words[i / 2] |= ((uint32_t)h << ((i % 2) * 16));
+        words[i / 2] |= ((uint32_t)SoftFloat::f64_to_fp16(vals[i]) << ((i % 2) * 16));
     }
     return words;
 }
 
-static double quantize_output(double v, const OTC_Config& cfg) {
-    using fp8_e4m3_t = ac_std_float<8, 4>;
-    using fp8_e5m2_t = ac_std_float<8, 5>;
-    using fp16_t = ac_std_float<16, 5>;
-    using fp22_t = ac_std_float<22, 8>;
-    using fp32_t = ac_std_float<32, 8>;
-
-    const fp22_t acc_val(v);
-    if (cfg.type_cd == TYPE_FP32) {
-        const fp32_t out = acc_val.template convert<32, 8, AC_RND_CONV>();
-        return out.to_double();
-    }
-    if (cfg.type_cd == TYPE_FP16) {
-        const fp16_t out = acc_val.template convert<16, 5, AC_RND_CONV>();
-        return out.to_double();
-    }
-    if (cfg.type_cd == TYPE_FP8) {
-        if (cfg.type_cd_sub == SUB_FP8E4M3) {
-            const fp8_e4m3_t out = acc_val.template convert<8, 4, AC_RND_CONV>();
-            return out.to_double();
-        }
-        const fp8_e5m2_t out = acc_val.template convert<8, 5, AC_RND_CONV>();
-        return out.to_double();
-    }
-    return acc_val.to_double();
-}
-
-static std::vector<double> golden_gemm_fp32(const TestData& td, const OTC_Config& cfg) {
-    // Golden path aligned with the simulator precision boundaries:
-    //   A/B input quantization -> high precision dot -> fp22 accumulate -> output quantization.
+static void unpack_quantized_inputs(const TestData& td, const OTC_Config& cfg,
+                                    std::vector<double>& aq, std::vector<double>& bq, std::vector<double>& cq) {
     auto pa = pack_ab(td.a, cfg.type_ab, cfg.type_ab_sub);
     auto pb = pack_ab(td.b, cfg.type_ab, cfg.type_ab_sub);
     auto pc = pack_c_fp16(td.c);
 
     int eb = FPConvert::elem_bits(cfg.type_ab);
     int eperw = 32 / eb;
-    std::vector<double> a(cfg.M * cfg.K), b(cfg.K * cfg.N), c(cfg.M * cfg.N);
+
+    aq.resize(cfg.M * cfg.K);
+    bq.resize(cfg.K * cfg.N);
+    cq.resize(cfg.M * cfg.N);
 
     for (int i = 0; i < cfg.M * cfg.K; i++) {
-        int wi = i / eperw, ei = i % eperw;
-        a[i] = FPConvert::elem_to_f64(wi < (int)pa.size() ? pa[wi] : 0, ei, cfg.type_ab, cfg.type_ab_sub);
+        int wi = i / eperw;
+        int ei = i % eperw;
+        uint32_t w = (wi < (int)pa.size()) ? pa[wi] : 0;
+        aq[i] = FPConvert::elem_to_f64(w, ei, cfg.type_ab, cfg.type_ab_sub);
     }
     for (int i = 0; i < cfg.K * cfg.N; i++) {
-        int wi = i / eperw, ei = i % eperw;
-        b[i] = FPConvert::elem_to_f64(wi < (int)pb.size() ? pb[wi] : 0, ei, cfg.type_ab, cfg.type_ab_sub);
+        int wi = i / eperw;
+        int ei = i % eperw;
+        uint32_t w = (wi < (int)pb.size()) ? pb[wi] : 0;
+        bq[i] = FPConvert::elem_to_f64(w, ei, cfg.type_ab, cfg.type_ab_sub);
     }
     for (int i = 0; i < cfg.M * cfg.N; i++) {
-        int wi = i / 2, ei = i % 2;
-        uint32_t w = wi < (int)pc.size() ? pc[wi] : 0;
-        uint16_t half = (w >> (ei * 16)) & 0xFFFF;
-        c[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(half)));
+        int wi = i / 2;
+        int ei = i % 2;
+        uint32_t w = (wi < (int)pc.size()) ? pc[wi] : 0;
+        uint16_t h = (w >> (ei * 16)) & 0xFFFF;
+        cq[i] = SoftFloat::fp16_to_f64(h);
     }
+}
 
+
+static std::vector<double> golden_model_quantized(const std::vector<double>& aq, const std::vector<double>& bq,
+                                                  const std::vector<double>& cq, const OTC_Config& cfg) {
     std::vector<double> d(cfg.M * cfg.N, 0.0);
     for (int i = 0; i < cfg.M; i++) {
         for (int j = 0; j < cfg.N; j++) {
-            double dot = 0.0;
+            std::vector<uint16_t> ts(cfg.K);
             for (int k = 0; k < cfg.K; k++) {
-                dot += a[i * cfg.K + k] * b[k * cfg.N + j];
+                uint16_t a9 = SoftFloat::f64_to_fp9(aq[i * cfg.K + k]);
+                uint16_t b9 = SoftFloat::f64_to_fp9(bq[k * cfg.N + j]);
+                ts[k] = SoftFloat::f64_to_fp13(SoftFloat::fp9_to_f64(FPEmu::fp9_mul(a9, b9)));
             }
-            double acc_fp22 = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot + c[i * cfg.N + j]));
-            d[i * cfg.N + j] = quantize_output(acc_fp22, cfg);
+            int w = cfg.K;
+            while (w > 1) {
+                for (int x = 0; x < w / 2; x++) ts[x] = FPEmu::fp13_add(ts[2 * x], ts[2 * x + 1]);
+                w >>= 1;
+            }
+            uint32_t c22 = SoftFloat::f64_to_fp22(cq[i * cfg.N + j]);
+            uint32_t out22 = FPEmu::fp22_add(FPEmu::fp9_to_fp22(FPEmu::fp13_to_fp9(ts[0])), c22);
+            if (cfg.type_cd == TYPE_FP16) {
+                d[i * cfg.N + j] = SoftFloat::fp16_to_f64(FPEmu::fp22_to_fp16(out22));
+            } else if (cfg.type_cd == TYPE_FP32) {
+                d[i * cfg.N + j] = SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(SoftFloat::fp22_to_f64(out22)));
+            } else {
+                uint8_t fp8 = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPEmu::fp22_to_fp8(out22, SUB_FP8E4M3)
+                                                                : FPEmu::fp22_to_fp8(out22, SUB_FP8E5M2);
+                d[i * cfg.N + j] = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(fp8)
+                                                                     : FPConvert::fp8e5m2_to_f64(fp8);
+            }
         }
     }
     return d;
 }
 
-static bool verify(const std::vector<double>& got, const std::vector<double>& ref, double rtol, double atol, int M, int N) {
-    bool pass = true;
-    int nerr = 0;
-    double max_err = 0, sum_err = 0;
-    for (int i = 0; i < M * N; i++) {
-        double err = fabs(got[i] - ref[i]);
-        double thr = rtol * fabs(ref[i]) + atol;
-        max_err = std::max(max_err, err);
-        sum_err += err;
-        if (err > thr) {
-            if (nerr < 5) {
-                std::cout << "  MISMATCH D[" << i / N << "][" << i % N << "]: got=" << got[i]
-                          << " ref=" << ref[i] << " err=" << err << " (thr=" << thr << ")\n";
+static std::vector<double> golden_fp32_unquantized(const std::vector<double>& aq, const std::vector<double>& bq,
+                                                    const std::vector<double>& cq, const OTC_Config& cfg) {
+    std::vector<double> d(cfg.M * cfg.N, 0.0);
+    for (int i = 0; i < cfg.M; i++) {
+        for (int j = 0; j < cfg.N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < cfg.K; k++) {
+                sum += (float)aq[i * cfg.K + k] * (float)bq[k * cfg.N + j];
             }
-            pass = false;
-            nerr++;
+            d[i * cfg.N + j] = (double)(sum + (float)cq[i * cfg.N + j]);
         }
     }
-    if (nerr > 5) std::cout << "  ... and " << (nerr - 5) << " more mismatches\n";
-    std::cout << "  Error stats: max=" << std::fixed << std::setprecision(6) << max_err
-              << " avg=" << (sum_err / (M * N)) << "\n";
-    return pass;
+    return d;
 }
 
-static uint32_t build_inst(uint8_t opcode, uint8_t funct3, uint8_t rd = 0, uint8_t rs1 = 0, uint8_t rs2 = 0, uint8_t funct7 = 0) {
-    return ((uint32_t)funct7 << 25) | ((uint32_t)rs2 << 20) | ((uint32_t)rs1 << 15) | ((uint32_t)funct3 << 12)
-           | ((uint32_t)rd << 7) | opcode;
+static std::vector<double> golden_fp32_quantized(const std::vector<double>& unq, const OTC_Config& cfg) {
+    std::vector<double> q(unq.size(), 0.0);
+    for (size_t i = 0; i < unq.size(); i++) {
+        double v = unq[i];
+        if (cfg.type_cd == TYPE_FP16) {
+            q[i] = SoftFloat::fp16_to_f64(SoftFloat::f64_to_fp16(v));
+        } else if (cfg.type_cd == TYPE_FP32) {
+            q[i] = SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(v));
+        } else {
+            uint8_t fp8 = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(v) : FPConvert::f64_to_fp8e5m2(v);
+            q[i] = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(fp8) : FPConvert::fp8e5m2_to_f64(fp8);
+        }
+    }
+    return q;
 }
 
-static bool execute_program(OTC_Device* dev, const std::vector<uint32_t>& pa, const std::vector<uint32_t>& pb,
-                            const std::vector<uint32_t>& pc, int batches, std::vector<double>& result) {
-    OTC_Decoder decoder;
-    decoder.init();
+static void print_matrix(const char* tag, const std::vector<double>& m, int R, int C) {
+    printf("%s\n", tag);
+    for (int i = 0; i < R; i++) {
+        for (int j = 0; j < C; j++) printf("%9.5f ", m[i * C + j]);
+        printf("\n");
+    }
+}
 
-    // Fetch/Decode/Execute loop (main control loop)
-    std::vector<uint32_t> program = {
-        build_inst(0x23, 0x01),  // TCU_LOAD A/B/C
-        build_inst(0x21, 0x01),  // TCU_WMMA
-        build_inst(0x27, 0x01),  // TCU_STORE
+int main() {
+    std::vector<PrecCase> cases = {
+        {TYPE_FP4,  SUB_FP8E5M2, TYPE_FP16, SUB_FP8E5M2, "ab=fp4 -> out=fp16"},
+        {TYPE_FP8,  SUB_FP8E4M3, TYPE_FP16, SUB_FP8E5M2, "ab=fp8e4m3 -> out=fp16"},
+        {TYPE_FP8,  SUB_FP8E5M2, TYPE_FP16, SUB_FP8E5M2, "ab=fp8e5m2 -> out=fp16"},
+        {TYPE_FP16, SUB_FP8E5M2, TYPE_FP16, SUB_FP8E5M2, "ab=fp16 -> out=fp16"},
+        {TYPE_FP8,  SUB_FP8E4M3, TYPE_FP8,  SUB_FP8E4M3, "ab=fp8e4m3 -> out=fp8e4m3"},
+        {TYPE_FP8,  SUB_FP8E5M2, TYPE_FP8,  SUB_FP8E5M2, "ab=fp8e5m2 -> out=fp8e5m2"},
+        {TYPE_FP16, SUB_FP8E5M2, TYPE_FP32, SUB_FP8E5M2, "ab=fp16 -> out=fp32"},
     };
 
-    size_t pc_idx = 0;
-    while (pc_idx < program.size()) {
-        uint32_t inst_word = program[pc_idx++];             // Fetch
-        DecodedInst inst = decoder.decode(inst_word);       // Decode
-        if (!inst.valid) {
-            std::cout << "Decode error at pc=" << (pc_idx - 1) << "\n";
-            return false;
-        }
+    constexpr int kRepeat = 6;
+    bool all = true;
 
-        switch (inst.op) {                                  // Execute
-            case OTC_OpType::TCU_LOAD:
-                break;
-            case OTC_OpType::TCU_WMMA:
-                for (int b = 0; b < batches; b++) {
-                    while (otc_submit(dev, pa.data(), pa.size(), pb.data(), pb.size(), pc.data(), pc.size()) != 0) {
-                        if (otc_run(dev) != 0) {
-                            std::cout << "Execution timeout\n";
-                            return false;
-                        }
-                    }
-                }
-                if (otc_run(dev) != 0) {
-                    std::cout << "Execution timeout\n";
-                    return false;
-                }
-                break;
-            case OTC_OpType::TCU_STORE:
-                for (int b = 0; b < batches; ++b) {
-                    if (otc_pop_result_f64(dev, result.data(), result.size()) <= 0) {
-                        std::cout << "No output popped from FIFO\n";
-                        return false;
-                    }
-                }
-                break;
-            default:
-                break;
-        }
-    }
-    return true;
-}
+    for (const auto& tc : cases) {
+        for (int run = 0; run < kRepeat; ++run) {
+            OTC_Config cfg;
+            cfg.M = 8;
+            cfg.K = 8;
+            cfg.N = 8;
+            cfg.type_ab = tc.type_ab;
+            cfg.type_ab_sub = tc.type_ab_sub;
+            cfg.type_cd = tc.type_cd;
+            cfg.type_cd_sub = tc.type_cd_sub;
 
-static Args parse_args(int argc, char** argv) {
-    Args a;
-    for (int i = 1; i < argc; i++) {
-        std::string s = argv[i];
-        if (s.find("--M=") == 0) a.cfg.M = std::stoi(s.substr(4));
-        else if (s.find("--K=") == 0) a.cfg.K = std::stoi(s.substr(4));
-        else if (s.find("--N=") == 0) a.cfg.N = std::stoi(s.substr(4));
-        else if (s == "--type_ab=fp4") a.cfg.type_ab = TYPE_FP4;
-        else if (s == "--type_ab=fp8e5m2") { a.cfg.type_ab = TYPE_FP8; a.cfg.type_ab_sub = SUB_FP8E5M2; }
-        else if (s == "--type_ab=fp8e4m3") { a.cfg.type_ab = TYPE_FP8; a.cfg.type_ab_sub = SUB_FP8E4M3; }
-        else if (s == "--type_ab=fp16") a.cfg.type_ab = TYPE_FP16;
-        else if (s == "--type_cd=fp8e5m2") { a.cfg.type_cd = TYPE_FP8; a.cfg.type_cd_sub = SUB_FP8E5M2; }
-        else if (s == "--type_cd=fp8e4m3") { a.cfg.type_cd = TYPE_FP8; a.cfg.type_cd_sub = SUB_FP8E4M3; }
-        else if (s == "--type_cd=fp16") a.cfg.type_cd = TYPE_FP16;
-        else if (s == "--type_cd=fp32") a.cfg.type_cd = TYPE_FP32;
-        else if (s.find("--debug=") == 0) a.cfg.debug_level = std::stoi(s.substr(8));
-        else if (s.find("--dispatch_width=") == 0) a.cfg.dispatch_width = std::stoi(s.substr(17));
-        else if (s.find("--out_fifo_depth=") == 0) a.cfg.output_fifo_depth = std::stoi(s.substr(17));
-        else if (s.find("--mem_bw=") == 0) a.cfg.mem_bandwidth_bytes_per_cycle = std::stoi(s.substr(9));
-        else if (s.find("--batches=") == 0) a.batches = std::stoi(s.substr(10));
-        else if (s.find("--random_runs=") == 0) a.random_runs = std::stoi(s.substr(14));
-        else if (s == "--trace") a.cfg.trace_en = true;
-        else if (s.find("--test=") == 0) a.test = s.substr(7);
-    }
-    return a;
-}
+            auto td = gen_random(8, 8, 8, 1000 + run + (int)(&tc - &cases[0]) * 100);
+            auto pa = pack_ab(td.a, cfg.type_ab, cfg.type_ab_sub);
+            auto pb = pack_ab(td.b, cfg.type_ab, cfg.type_ab_sub);
+            auto pc = pack_c_fp16(td.c);
 
-int main(int argc, char** argv) {
-    Args args = parse_args(argc, argv);
-    if (args.test == "simple") {
-        args.cfg.M = 2;
-        args.cfg.K = 2;
-        args.cfg.N = 2;
-    }
+            OTC_Device* dev = nullptr;
+            otc_dev_open(&dev);
+            otc_configure(dev, cfg);
+            otc_submit(dev, pa.data(), (int)pa.size(), pb.data(), (int)pb.size(), pc.data(), (int)pc.size());
+            otc_run(dev);
 
-    const int runs = (args.test == "random") ? std::max(1, args.random_runs) : 1;
-    bool all_pass = true;
+            std::vector<double> out(64);
+            otc_pop_result_f64(dev, out.data(), 64);
 
-    for (int run_id = 0; run_id < runs; run_id++) {
-        TestData td;
-        if (args.test == "identity") td = gen_identity(args.cfg.M, args.cfg.K, args.cfg.N);
-        else if (args.test == "random") td = gen_random(args.cfg.M, args.cfg.K, args.cfg.N, 42 + run_id);
-        else if (args.test == "simple") td = gen_simple();
-        else td = gen_ones(args.cfg.M, args.cfg.K, args.cfg.N);
+            std::vector<double> aq, bq, cq;
+            unpack_quantized_inputs(td, cfg, aq, bq, cq);
+            auto gold_fp32 = golden_fp32_unquantized(aq, bq, cq, cfg);
+            auto gold_quant = golden_fp32_quantized(gold_fp32, cfg);
+            auto gold_model = golden_model_quantized(aq, bq, cq, cfg);
 
-        auto pa = pack_ab(td.a, args.cfg.type_ab, args.cfg.type_ab_sub);
-        auto pb = pack_ab(td.b, args.cfg.type_ab, args.cfg.type_ab_sub);
-        auto pc = pack_c_fp16(td.c);
+            printf("\n=== %s, run=%d ===\n", tc.name, run);
+            print_matrix("result", out, 8, 8);
+            print_matrix("golden_fp32_unquantized", gold_fp32, 8, 8);
+            print_matrix("golden_quantized", gold_quant, 8, 8);
 
-        OTC_Device* dev;
-        otc_dev_open(&dev);
-        if (otc_configure(dev, args.cfg) != 0) {
-            std::cout << "Invalid config\n";
+            double maxe_fp32q = 0.0;
+            double maxe_model = 0.0;
+            for (int i = 0; i < 64; i++) {
+                maxe_fp32q = std::max(maxe_fp32q, fabs(out[i] - gold_quant[i]));
+                maxe_model = std::max(maxe_model, fabs(out[i] - gold_model[i]));
+            }
+            printf("max_err_vs_fp32_quantized=%f\n", maxe_fp32q);
+            printf("max_err_vs_model_quantized=%f\n", maxe_model);
+            all = all && (maxe_model < 1e-6);
             otc_dev_close(dev);
-            return 1;
         }
-
-        std::vector<double> result(args.cfg.M * args.cfg.N, 0.0);
-        bool exec_ok = execute_program(dev, pa, pb, pc, args.batches, result);
-        if (!exec_ok) {
-            otc_dev_close(dev);
-            return 1;
-        }
-
-        auto gold_fp32 = golden_gemm_fp32(td, args.cfg);
-        double rtol = (args.cfg.type_ab == TYPE_FP16) ? 0.05 : 0.10;
-        double atol = (args.cfg.type_cd == TYPE_FP8) ? 0.30 : 0.08;
-        if (args.cfg.type_cd == TYPE_FP8 && args.cfg.type_cd_sub == SUB_FP8E4M3) atol = 0.80;
-
-        std::cout << "[Run " << run_id << "] verify vs FP32 golden\n";
-        bool pass = verify(result, gold_fp32, rtol, atol, args.cfg.M, args.cfg.N);
-        all_pass = all_pass && pass;
-
-        if (run_id == runs - 1) {
-            otc_stats(dev).print(std::cout);
-        }
-        otc_dev_close(dev);
     }
 
-    std::cout << "\nOverall: " << (all_pass ? "PASSED" : "FAILED") << "\n";
-    return all_pass ? 0 : 1;
+    printf("\nOverall: %s\n", all ? "PASSED" : "FAILED");
+    return all ? 0 : 1;
 }
