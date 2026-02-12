@@ -309,6 +309,7 @@ void TensorCoreUnit::collect_results() {
             active_batch_ = {};
         }
     }
+    return false;
 }
 
 bool TensorCoreUnit::push_output_result(const BatchResult& br) {
