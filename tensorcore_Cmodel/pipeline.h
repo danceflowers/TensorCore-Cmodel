@@ -14,15 +14,15 @@ struct BatchResult {
 
 // Per-dot-product input/output packet.
 struct DPInput {
-    std::vector<double> a_f64;
-    std::vector<double> b_f64;
-    double c_f64;
+    std::vector<uint16_t> a_fp9;
+    std::vector<uint16_t> b_fp9;
+    uint32_t c_fp22;
     int row;
     int col;
 };
 
 struct DPResult {
-    double value_f64;
+    uint32_t value_fp22;
     int row;
     int col;
 };
@@ -65,9 +65,9 @@ public:
     struct ActiveBatch {
         bool batch_valid = false;
         int batch_id = -1;
-        std::vector<double> a_f64;
-        std::vector<double> b_f64;
-        std::vector<double> c_f64;
+        std::vector<uint16_t> a_fp9;
+        std::vector<uint16_t> b_fp9;
+        std::vector<uint32_t> c_fp22;
         std::vector<double> d_f64;
         int dispatch_ptr = 0;
         int results_collected = 0;
