@@ -38,7 +38,29 @@ static std::vector<uint32_t> pack_ab(const std::vector<double>& vals, int type_a
         if (type_ab == TYPE_FP8) {
             packed = (sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(vals[i]) : FPConvert::f64_to_fp8e5m2(vals[i]);
         } else if (type_ab == TYPE_FP4) {
-            packed = (uint32_t)(SoftFloat::f64_to_fp9(vals[i]) >> 5) & 0xF;
+            double v = vals[i];
+            int sgn = (v < 0.0) ? 1 : 0;
+            double av = fabs(v);
+            int e = 0;
+            int m = 0;
+            if (av >= 4.0) {
+                e = 2;
+                m = 1;
+            } else if (av > 0.0) {
+                int exp;
+                double frac = frexp(av, &exp);
+                if (exp <= 0) {
+                    e = 0;
+                    m = (av >= 0.5) ? 1 : 0;
+                } else if (exp >= 3) {
+                    e = 2;
+                    m = 1;
+                } else {
+                    e = exp;
+                    m = (2.0 * frac - 1.0 >= 0.5) ? 1 : 0;
+                }
+            }
+            packed = (uint32_t)((sgn << 3) | (e << 1) | m);
         } else {
             packed = SoftFloat::f64_to_fp16(vals[i]);
         }
@@ -90,6 +112,47 @@ static void unpack_quantized_inputs(const TestData& td, const OTC_Config& cfg,
 }
 
 
+static std::vector<double> golden_model_quantized_from_packed(const std::vector<uint32_t>& pa,
+                                                             const std::vector<uint32_t>& pb,
+                                                             const std::vector<uint32_t>& pc,
+                                                             const OTC_Config& cfg) {
+    int eb = FPConvert::elem_bits(cfg.type_ab);
+    int eperw = 32 / eb;
+    std::vector<uint16_t> aq9(cfg.M * cfg.K), bq9(cfg.K * cfg.N);
+    std::vector<uint32_t> cq22(cfg.M * cfg.N, 0);
+
+    for (int i = 0; i < cfg.M * cfg.K; ++i) {
+        int wi = i / eperw;
+        int ei = i % eperw;
+        uint32_t w = (wi < (int)pa.size()) ? pa[wi] : 0;
+        if (cfg.type_ab == TYPE_FP4) aq9[i] = FPEmu::fp4_to_fp9((w >> (ei * 4)) & 0xF);
+        else if (cfg.type_ab == TYPE_FP8) {
+            uint8_t x = (w >> (ei * 8)) & 0xFF;
+            aq9[i] = (cfg.type_ab_sub == SUB_FP8E4M3) ? FPEmu::fp8e4m3_to_fp9(x) : FPEmu::fp8e5m2_to_fp9(x);
+        } else aq9[i] = FPEmu::fp16_to_fp9((w >> (ei * 16)) & 0xFFFF);
+    }
+
+    for (int i = 0; i < cfg.K * cfg.N; ++i) {
+        int wi = i / eperw;
+        int ei = i % eperw;
+        uint32_t w = (wi < (int)pb.size()) ? pb[wi] : 0;
+        if (cfg.type_ab == TYPE_FP4) bq9[i] = FPEmu::fp4_to_fp9((w >> (ei * 4)) & 0xF);
+        else if (cfg.type_ab == TYPE_FP8) {
+            uint8_t x = (w >> (ei * 8)) & 0xFF;
+            bq9[i] = (cfg.type_ab_sub == SUB_FP8E4M3) ? FPEmu::fp8e4m3_to_fp9(x) : FPEmu::fp8e5m2_to_fp9(x);
+        } else bq9[i] = FPEmu::fp16_to_fp9((w >> (ei * 16)) & 0xFFFF);
+    }
+
+    for (int i = 0; i < cfg.M * cfg.N; ++i) {
+        int wi = i / 2;
+        int ei = i % 2;
+        uint32_t w = (wi < (int)pc.size()) ? pc[wi] : 0;
+        uint16_t h = (w >> (ei * 16)) & 0xFFFF;
+        cq22[i] = SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(h));
+    }
+}
+
+
 static std::vector<double> golden_model_quantized(const std::vector<double>& aq, const std::vector<double>& bq,
                                                   const std::vector<double>& cq, const OTC_Config& cfg) {
     std::vector<double> d(cfg.M * cfg.N, 0.0);
@@ -97,26 +160,20 @@ static std::vector<double> golden_model_quantized(const std::vector<double>& aq,
         for (int j = 0; j < cfg.N; j++) {
             std::vector<uint16_t> ts(cfg.K);
             for (int k = 0; k < cfg.K; k++) {
-                uint16_t a9 = SoftFloat::f64_to_fp9(aq[i * cfg.K + k]);
-                uint16_t b9 = SoftFloat::f64_to_fp9(bq[k * cfg.N + j]);
-                ts[k] = SoftFloat::f64_to_fp13(SoftFloat::fp9_to_f64(FPEmu::fp9_mul(a9, b9)));
+                ts[k] = SoftFloat::f64_to_fp13(SoftFloat::fp9_to_f64(FPEmu::fp9_mul(aq9[i * cfg.K + k], bq9[k * cfg.N + j])));
             }
             int w = cfg.K;
             while (w > 1) {
                 for (int x = 0; x < w / 2; x++) ts[x] = FPEmu::fp13_add(ts[2 * x], ts[2 * x + 1]);
                 w >>= 1;
             }
-            uint32_t c22 = SoftFloat::f64_to_fp22(cq[i * cfg.N + j]);
-            uint32_t out22 = FPEmu::fp22_add(FPEmu::fp9_to_fp22(FPEmu::fp13_to_fp9(ts[0])), c22);
-            if (cfg.type_cd == TYPE_FP16) {
-                d[i * cfg.N + j] = SoftFloat::fp16_to_f64(FPEmu::fp22_to_fp16(out22));
-            } else if (cfg.type_cd == TYPE_FP32) {
-                d[i * cfg.N + j] = SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(SoftFloat::fp22_to_f64(out22)));
-            } else {
+            uint32_t out22 = FPEmu::fp22_add(FPEmu::fp9_to_fp22(FPEmu::fp13_to_fp9(ts[0])), cq22[i * cfg.N + j]);
+            if (cfg.type_cd == TYPE_FP16) d[i * cfg.N + j] = SoftFloat::fp16_to_f64(FPEmu::fp22_to_fp16(out22));
+            else if (cfg.type_cd == TYPE_FP32) d[i * cfg.N + j] = SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(SoftFloat::fp22_to_f64(out22)));
+            else {
                 uint8_t fp8 = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPEmu::fp22_to_fp8(out22, SUB_FP8E4M3)
                                                                 : FPEmu::fp22_to_fp8(out22, SUB_FP8E5M2);
-                d[i * cfg.N + j] = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(fp8)
-                                                                     : FPConvert::fp8e5m2_to_f64(fp8);
+                d[i * cfg.N + j] = (cfg.type_cd_sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(fp8) : FPConvert::fp8e5m2_to_f64(fp8);
             }
         }
     }
@@ -162,7 +219,16 @@ static void print_matrix(const char* tag, const std::vector<double>& m, int R, i
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    int repeat = 40;
+    int seed_base = 1000;
+    int sweeps = 3;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a.rfind("--repeat=", 0) == 0) repeat = std::max(1, std::stoi(a.substr(9)));
+        else if (a.rfind("--seed_base=", 0) == 0) seed_base = std::stoi(a.substr(12));
+        else if (a.rfind("--sweeps=", 0) == 0) sweeps = std::max(1, std::stoi(a.substr(9)));
+    }
     std::vector<PrecCase> cases = {
         {TYPE_FP4,  SUB_FP8E5M2, TYPE_FP16, SUB_FP8E5M2, "ab=fp4 -> out=fp16"},
         {TYPE_FP8,  SUB_FP8E4M3, TYPE_FP16, SUB_FP8E5M2, "ab=fp8e4m3 -> out=fp16"},
@@ -173,11 +239,14 @@ int main() {
         {TYPE_FP16, SUB_FP8E5M2, TYPE_FP32, SUB_FP8E5M2, "ab=fp16 -> out=fp32"},
     };
 
-    constexpr int kRepeat = 6;
     bool all = true;
 
-    for (const auto& tc : cases) {
-        for (int run = 0; run < kRepeat; ++run) {
+    for (int sweep = 0; sweep < sweeps; ++sweep) {
+        printf("\n================ Sweep %d/%d ================\n", sweep + 1, sweeps);
+        for (const auto& tc : cases) {
+            double case_max_fp32q = 0.0;
+            double case_max_model = 0.0;
+            for (int run = 0; run < repeat; ++run) {
             OTC_Config cfg;
             cfg.M = 8;
             cfg.K = 8;
@@ -187,7 +256,7 @@ int main() {
             cfg.type_cd = tc.type_cd;
             cfg.type_cd_sub = tc.type_cd_sub;
 
-            auto td = gen_random(8, 8, 8, 1000 + run + (int)(&tc - &cases[0]) * 100);
+            auto td = gen_random(8, 8, 8, seed_base + sweep * 10000 + run + (int)(&tc - &cases[0]) * 100);
             auto pa = pack_ab(td.a, cfg.type_ab, cfg.type_ab_sub);
             auto pb = pack_ab(td.b, cfg.type_ab, cfg.type_ab_sub);
             auto pc = pack_c_fp16(td.c);
@@ -205,12 +274,14 @@ int main() {
             unpack_quantized_inputs(td, cfg, aq, bq, cq);
             auto gold_fp32 = golden_fp32_unquantized(aq, bq, cq, cfg);
             auto gold_quant = golden_fp32_quantized(gold_fp32, cfg);
-            auto gold_model = golden_model_quantized(aq, bq, cq, cfg);
+            auto gold_model = golden_model_quantized_from_packed(pa, pb, pc, cfg);
 
             printf("\n=== %s, run=%d ===\n", tc.name, run);
-            print_matrix("result", out, 8, 8);
-            print_matrix("golden_fp32_unquantized", gold_fp32, 8, 8);
-            print_matrix("golden_quantized", gold_quant, 8, 8);
+            if (sweep == 0 && run < 2) {
+                print_matrix("result", out, 8, 8);
+                print_matrix("golden_fp32_unquantized", gold_fp32, 8, 8);
+                print_matrix("golden_quantized", gold_quant, 8, 8);
+            }
 
             double maxe_fp32q = 0.0;
             double maxe_model = 0.0;
@@ -218,13 +289,18 @@ int main() {
                 maxe_fp32q = std::max(maxe_fp32q, fabs(out[i] - gold_quant[i]));
                 maxe_model = std::max(maxe_model, fabs(out[i] - gold_model[i]));
             }
+            case_max_fp32q = std::max(case_max_fp32q, maxe_fp32q);
+            case_max_model = std::max(case_max_model, maxe_model);
             printf("max_err_vs_fp32_quantized=%f\n", maxe_fp32q);
             printf("max_err_vs_model_quantized=%f\n", maxe_model);
             all = all && (maxe_model < 1e-6);
             otc_dev_close(dev);
         }
+            printf("[Case Summary] %s | max_err_fp32_quantized=%f | max_err_model_quantized=%f\n",
+                   tc.name, case_max_fp32q, case_max_model);
+        }
     }
 
-    printf("\nOverall: %s\n", all ? "PASSED" : "FAILED");
+    printf("\nOverall: %s (repeat=%d, sweeps=%d, seed_base=%d)\n", all ? "PASSED" : "FAILED", repeat, sweeps, seed_base);
     return all ? 0 : 1;
 }
