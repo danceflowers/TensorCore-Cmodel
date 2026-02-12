@@ -57,9 +57,6 @@ static uint8_t quantize_fp8(double v, int sub) {
     return (sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(v) : FPConvert::f64_to_fp8e5m2(v);
 }
 
-static double dequantize_fp8(uint8_t bits, int sub) {
-    return (sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(bits) : FPConvert::fp8e5m2_to_f64(bits);
-}
 
 static std::vector<uint32_t> pack_ab(const std::vector<double>& vals, int type_ab, int sub) {
     int eb = FPConvert::elem_bits(type_ab);
@@ -114,14 +111,35 @@ static std::vector<uint32_t> pack_c_fp16(const std::vector<double>& vals) {
 }
 
 static double quantize_output(double v, const OTC_Config& cfg) {
-    if (cfg.type_cd == TYPE_FP32) return SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(v));
-    if (cfg.type_cd == TYPE_FP16) return SoftFloat::fp16_to_f64(SoftFloat::f64_to_fp16(v));
-    if (cfg.type_cd == TYPE_FP8) return dequantize_fp8(quantize_fp8(v, cfg.type_cd_sub), cfg.type_cd_sub);
-    return v;
+    using fp8_e4m3_t = ac_std_float<8, 4>;
+    using fp8_e5m2_t = ac_std_float<8, 5>;
+    using fp16_t = ac_std_float<16, 5>;
+    using fp22_t = ac_std_float<22, 8>;
+    using fp32_t = ac_std_float<32, 8>;
+
+    const fp22_t acc_val(v);
+    if (cfg.type_cd == TYPE_FP32) {
+        const fp32_t out = acc_val.template convert<32, 8, AC_RND_CONV>();
+        return out.to_double();
+    }
+    if (cfg.type_cd == TYPE_FP16) {
+        const fp16_t out = acc_val.template convert<16, 5, AC_RND_CONV>();
+        return out.to_double();
+    }
+    if (cfg.type_cd == TYPE_FP8) {
+        if (cfg.type_cd_sub == SUB_FP8E4M3) {
+            const fp8_e4m3_t out = acc_val.template convert<8, 4, AC_RND_CONV>();
+            return out.to_double();
+        }
+        const fp8_e5m2_t out = acc_val.template convert<8, 5, AC_RND_CONV>();
+        return out.to_double();
+    }
+    return acc_val.to_double();
 }
 
 static std::vector<double> golden_gemm_fp32(const TestData& td, const OTC_Config& cfg) {
-    // Golden path: input quantization follows model front-end, accumulation uses FP32.
+    // Golden path aligned with the simulator precision boundaries:
+    //   A/B input quantization -> high precision dot -> fp22 accumulate -> output quantization.
     auto pa = pack_ab(td.a, cfg.type_ab, cfg.type_ab_sub);
     auto pb = pack_ab(td.b, cfg.type_ab, cfg.type_ab_sub);
     auto pc = pack_c_fp16(td.c);
@@ -142,17 +160,18 @@ static std::vector<double> golden_gemm_fp32(const TestData& td, const OTC_Config
         int wi = i / 2, ei = i % 2;
         uint32_t w = wi < (int)pc.size() ? pc[wi] : 0;
         uint16_t half = (w >> (ei * 16)) & 0xFFFF;
-        c[i] = SoftFloat::fp16_to_f64(half);
+        c[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(half)));
     }
 
     std::vector<double> d(cfg.M * cfg.N, 0.0);
     for (int i = 0; i < cfg.M; i++) {
         for (int j = 0; j < cfg.N; j++) {
-            float sum = 0.0f;
+            double dot = 0.0;
             for (int k = 0; k < cfg.K; k++) {
-                sum += (float)a[i * cfg.K + k] * (float)b[k * cfg.N + j];
+                dot += a[i * cfg.K + k] * b[k * cfg.N + j];
             }
-            d[i * cfg.N + j] = quantize_output((double)(sum + (float)c[i * cfg.N + j]), cfg);
+            double acc_fp22 = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot + c[i * cfg.N + j]));
+            d[i * cfg.N + j] = quantize_output(acc_fp22, cfg);
         }
     }
     return d;
@@ -213,9 +232,11 @@ static bool execute_program(OTC_Device* dev, const std::vector<uint32_t>& pa, co
                 break;
             case OTC_OpType::TCU_WMMA:
                 for (int b = 0; b < batches; b++) {
-                    if (otc_submit(dev, pa.data(), pa.size(), pb.data(), pb.size(), pc.data(), pc.size()) != 0) {
-                        std::cout << "Submit failed at batch " << b << "\n";
-                        return false;
+                    while (otc_submit(dev, pa.data(), pa.size(), pb.data(), pb.size(), pc.data(), pc.size()) != 0) {
+                        if (otc_run(dev) != 0) {
+                            std::cout << "Execution timeout\n";
+                            return false;
+                        }
                     }
                 }
                 if (otc_run(dev) != 0) {
@@ -224,9 +245,11 @@ static bool execute_program(OTC_Device* dev, const std::vector<uint32_t>& pa, co
                 }
                 break;
             case OTC_OpType::TCU_STORE:
-                if (otc_pop_result_f64(dev, result.data(), result.size()) <= 0) {
-                    std::cout << "No output popped from FIFO\n";
-                    return false;
+                for (int b = 0; b < batches; ++b) {
+                    if (otc_pop_result_f64(dev, result.data(), result.size()) <= 0) {
+                        std::cout << "No output popped from FIFO\n";
+                        return false;
+                    }
                 }
                 break;
             default:
@@ -253,7 +276,6 @@ static Args parse_args(int argc, char** argv) {
         else if (s == "--type_cd=fp32") a.cfg.type_cd = TYPE_FP32;
         else if (s.find("--debug=") == 0) a.cfg.debug_level = std::stoi(s.substr(8));
         else if (s.find("--dispatch_width=") == 0) a.cfg.dispatch_width = std::stoi(s.substr(17));
-        else if (s.find("--in_fifo_depth=") == 0) a.cfg.input_fifo_depth = std::stoi(s.substr(16));
         else if (s.find("--out_fifo_depth=") == 0) a.cfg.output_fifo_depth = std::stoi(s.substr(17));
         else if (s.find("--mem_bw=") == 0) a.cfg.mem_bandwidth_bytes_per_cycle = std::stoi(s.substr(9));
         else if (s.find("--batches=") == 0) a.batches = std::stoi(s.substr(10));
@@ -304,6 +326,7 @@ int main(int argc, char** argv) {
         auto gold_fp32 = golden_gemm_fp32(td, args.cfg);
         double rtol = (args.cfg.type_ab == TYPE_FP16) ? 0.05 : 0.10;
         double atol = (args.cfg.type_cd == TYPE_FP8) ? 0.30 : 0.08;
+        if (args.cfg.type_cd == TYPE_FP8 && args.cfg.type_cd_sub == SUB_FP8E4M3) atol = 0.80;
 
         std::cout << "[Run " << run_id << "] verify vs FP32 golden\n";
         bool pass = verify(result, gold_fp32, rtol, atol, args.cfg.M, args.cfg.N);

@@ -33,7 +33,6 @@ struct OTC_Config {
     int add_latency = 2;
     int conv_latency = 1;
     int dispatch_width = 8;
-    int input_fifo_depth = 8;
     int output_fifo_depth = 8;
     int mem_bandwidth_bytes_per_cycle = 32;
 
@@ -56,7 +55,6 @@ struct OTC_Stats {
     uint64_t conv_cycles = 0;
     uint64_t format_active_cycles = 0;
     uint64_t dispatch_active_cycles = 0;
-    uint64_t input_fifo_stall_cycles = 0;
     uint64_t output_backpressure_cycles = 0;
     uint64_t output_fifo_max_occupancy = 0;
     uint64_t dp_busy_unit_cycles = 0;

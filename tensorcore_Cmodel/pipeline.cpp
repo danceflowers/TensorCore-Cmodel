@@ -130,8 +130,6 @@ void TensorCoreUnit::reset() {
     stats_.dp_capacity_units = cfg_.total_dp();
     stats_.peak_bw_bytes_per_cycle = cfg_.mem_bandwidth_bytes_per_cycle;
 
-    input_fifo_.clear();
-    format_fifo_.clear();
     output_fifo_.clear();
     active_batch_ = {};
 
@@ -144,24 +142,62 @@ void TensorCoreUnit::reset() {
     std::fill(last_output_d_.begin(), last_output_d_.end(), 0.0);
 }
 
-bool TensorCoreUnit::enqueue_job(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, const std::vector<uint32_t>& c) {
-    if ((int)input_fifo_.size() >= cfg_.input_fifo_depth) {
+bool TensorCoreUnit::try_start_batch(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b,
+                                    const std::vector<uint32_t>& c) {
+    if (active_batch_.batch_valid) {
         return false;
     }
 
-    BatchJob job;
-    job.batch_id = next_batch_id_++;
-    job.raw_a = a;
-    job.raw_b = b;
-    job.raw_c = c;
-    input_fifo_.push_back(job);
+    active_batch_.batch_valid = true;
+    active_batch_.batch_id = next_batch_id_++;
+    active_batch_.a_f64.resize(cfg_.M * cfg_.K);
+    active_batch_.b_f64.resize(cfg_.K * cfg_.N);
+    active_batch_.c_f64.resize(cfg_.M * cfg_.N, 0.0);
+    active_batch_.d_f64.assign(cfg_.M * cfg_.N, 0.0);
+    active_batch_.dispatch_ptr = 0;
+    active_batch_.results_collected = 0;
+    active_batch_.start_cycle = cycle_;
+
+    const int elem_bits = FPConvert::elem_bits(cfg_.type_ab);
+    const int elems_per_word = 32 / elem_bits;
+
+    for (int i = 0; i < cfg_.M * cfg_.K; ++i) {
+        const int wi = i / elems_per_word;
+        const int ei = i % elems_per_word;
+        const uint32_t w = (wi < (int)a.size()) ? a[wi] : 0;
+        active_batch_.a_f64[i] = FPConvert::elem_to_f64(w, ei, cfg_.type_ab, cfg_.type_ab_sub);
+    }
+
+    for (int i = 0; i < cfg_.K * cfg_.N; ++i) {
+        const int wi = i / elems_per_word;
+        const int ei = i % elems_per_word;
+        const uint32_t w = (wi < (int)b.size()) ? b[wi] : 0;
+        active_batch_.b_f64[i] = FPConvert::elem_to_f64(w, ei, cfg_.type_ab, cfg_.type_ab_sub);
+    }
+
+    for (int i = 0; i < cfg_.M * cfg_.N; ++i) {
+        const int wi = i / 2;
+        const int ei = i % 2;
+        const uint32_t w = (wi < (int)c.size()) ? c[wi] : 0;
+        const uint16_t half = (w >> (ei * 16)) & 0xFFFF;
+        active_batch_.c_f64[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(half)));
+    }
+
+    stats_.dram_read_bytes += (uint64_t)(a.size() + b.size() + c.size()) * 4;
     stats_.batches_enqueued++;
+    stats_.format_active_cycles++;
+    DT.log(2, "ACTIVATE batch#%d", active_batch_.batch_id);
     return true;
+}
+
+bool TensorCoreUnit::enqueue_job(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b,
+                                 const std::vector<uint32_t>& c) {
+    return try_start_batch(a, b, c);
 }
 
 void TensorCoreUnit::load(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, const std::vector<uint32_t>& c) {
     if (!enqueue_job(a, b, c)) {
-        DT.log(1, "WARNING: input FIFO full (depth=%d), batch dropped", cfg_.input_fifo_depth);
+        DT.log(1, "WARNING: core busy, batch dropped (only output FIFO is buffered)");
     }
 }
 
@@ -169,72 +205,6 @@ void TensorCoreUnit::start() {
     assert(state_ == IDLE || state_ == DONE);
     state_ = RUNNING;
     DT.log(1, "START: cycle-stepping pipeline enabled");
-}
-
-void TensorCoreUnit::do_format_conversion_stage() {
-    if (input_fifo_.empty()) {
-        return;
-    }
-
-    const BatchJob& in_job = input_fifo_.front();
-    BatchWork out_work;
-    out_work.batch_id = in_job.batch_id;
-
-    const int elem_bits = FPConvert::elem_bits(cfg_.type_ab);
-    const int elems_per_word = 32 / elem_bits;
-
-    out_work.a_f64.resize(cfg_.M * cfg_.K);
-    for (int i = 0; i < cfg_.M * cfg_.K; ++i) {
-        const int wi = i / elems_per_word;
-        const int ei = i % elems_per_word;
-        const uint32_t w = (wi < (int)in_job.raw_a.size()) ? in_job.raw_a[wi] : 0;
-        out_work.a_f64[i] = FPConvert::elem_to_f64(w, ei, cfg_.type_ab, cfg_.type_ab_sub);
-    }
-
-    out_work.b_f64.resize(cfg_.K * cfg_.N);
-    for (int i = 0; i < cfg_.K * cfg_.N; ++i) {
-        const int wi = i / elems_per_word;
-        const int ei = i % elems_per_word;
-        const uint32_t w = (wi < (int)in_job.raw_b.size()) ? in_job.raw_b[wi] : 0;
-        out_work.b_f64[i] = FPConvert::elem_to_f64(w, ei, cfg_.type_ab, cfg_.type_ab_sub);
-    }
-
-    out_work.c_f64.resize(cfg_.M * cfg_.N, 0.0);
-    for (int i = 0; i < cfg_.M * cfg_.N; ++i) {
-        const int wi = i / 2;
-        const int ei = i % 2;
-        const uint32_t w = (wi < (int)in_job.raw_c.size()) ? in_job.raw_c[wi] : 0;
-        const uint16_t half = (w >> (ei * 16)) & 0xFFFF;
-        out_work.c_f64[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(half)));
-    }
-
-    const uint64_t read_bytes = (uint64_t)(in_job.raw_a.size() + in_job.raw_b.size() + in_job.raw_c.size()) * 4;
-    stats_.dram_read_bytes += read_bytes;
-
-    format_fifo_.push_back(out_work);
-    input_fifo_.pop_front();
-    DT.log(2, "FORMAT batch#%d done", out_work.batch_id);
-}
-
-bool TensorCoreUnit::load_active_from_format() {
-    if (active_batch_.batch_valid || format_fifo_.empty()) {
-        return false;
-    }
-
-    const BatchWork& work = format_fifo_.front();
-    active_batch_.batch_valid = true;
-    active_batch_.batch_id = work.batch_id;
-    active_batch_.a_f64 = work.a_f64;
-    active_batch_.b_f64 = work.b_f64;
-    active_batch_.c_f64 = work.c_f64;
-    active_batch_.d_f64.assign(cfg_.M * cfg_.N, 0.0);
-    active_batch_.dispatch_ptr = 0;
-    active_batch_.results_collected = 0;
-    active_batch_.start_cycle = cycle_;
-
-    format_fifo_.pop_front();
-    DT.log(2, "ACTIVATE batch#%d", active_batch_.batch_id);
-    return true;
 }
 
 void TensorCoreUnit::dispatch_some(OTC_Stats& stats) {
@@ -309,7 +279,6 @@ void TensorCoreUnit::collect_results() {
             active_batch_ = {};
         }
     }
-    return false;
 }
 
 bool TensorCoreUnit::push_output_result(const BatchResult& br) {
@@ -333,10 +302,9 @@ bool TensorCoreUnit::pop_output_result(BatchResult& br) {
     return true;
 }
 
-bool TensorCoreUnit::can_accept_job() const { return (int)input_fifo_.size() < cfg_.input_fifo_depth; }
+bool TensorCoreUnit::can_accept_job() const { return !active_batch_.batch_valid; }
 
 bool TensorCoreUnit::has_pending_work() const {
-    if (!input_fifo_.empty() || !format_fifo_.empty()) return true;
     if (active_batch_.batch_valid) return true;
     for (const auto& dp : dp_units_) {
         if (dp.busy()) return true;
@@ -355,16 +323,6 @@ void TensorCoreUnit::tick() {
 
     bool stage_enable = false;
 
-    if (!input_fifo_.empty()) {
-        stats_.format_active_cycles++;
-        stage_enable = true;
-        do_format_conversion_stage();
-    }
-
-    if (load_active_from_format()) {
-        stage_enable = true;
-    }
-
     if (active_batch_.batch_valid) {
         stage_enable = true;
         dispatch_some(stats_);
@@ -376,9 +334,6 @@ void TensorCoreUnit::tick() {
         stats_.busy_cycles++;
     } else {
         stats_.stall_cycles++;
-        if (!can_accept_job()) {
-            stats_.input_fifo_stall_cycles++;
-        }
     }
 
     stats_.dp_busy_unit_cycles = dp_busy_acc_cycles_;

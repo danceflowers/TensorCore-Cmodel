@@ -56,7 +56,6 @@ make test-all           # 所有测试 (7 个用例)
 | `--trace` | 写入 otc_run.log | off |
 | `--batches=N` | 多 batch 提交数量 | 1 |
 | `--dispatch_width=N` | 每周期下发 DP 数 | 8 |
-| `--in_fifo_depth=N` | 输入 FIFO 深度 | 8 |
 | `--out_fifo_depth=N` | 输出 FIFO 深度 | 8 |
 | `--mem_bw=N` | 峰值带宽（B/cycle）用于带宽利用率估算 | 32 |
 | `--random_runs=N` | random 测试重复次数 | 5 |
@@ -82,7 +81,7 @@ FP16 ones 8×8×8 PASSED ✓  (13 cyc)
 
 当前模型支持通过 `otc_submit` 连续提交多个 batch，并在 `tick()` 中逐周期推进：
 
-- 输入队列：`input_fifo_depth` 可配置，模拟前端请求缓存。
+- 输入请求不再通过 FIFO 缓存，核心空闲时直接接收 batch。
 - 格式转换阶段与计算阶段并行推进（cycle-stepping）。
 - 输出队列：`output_fifo_depth` 可配置，支持背压统计。
 - 新增统计项：
@@ -95,7 +94,7 @@ FP16 ones 8×8×8 PASSED ✓  (13 cyc)
 示例：
 
 ```bash
-./otc_simx --test=ones --batches=8 --dispatch_width=16 --in_fifo_depth=16 --out_fifo_depth=16 --mem_bw=64
+./otc_simx --test=ones --batches=8 --dispatch_width=16 --out_fifo_depth=16 --mem_bw=64
 ```
 
 
@@ -108,3 +107,10 @@ FP16 ones 8×8×8 PASSED ✓  (13 cyc)
 - `TCU_STORE`：从输出 FIFO 弹出结果
 
 这样实现了将 tensor core 计算模块封装在 `otc_driver` 内，并与 `otc_decode` 在主循环中集成。
+
+
+## 构建依赖说明
+
+当前代码路径使用 `ac_std_float` 风格 API 描述精度转换边界；在缺少完整 AC datatype 依赖（如 `ac_float.h`）的环境下，工程通过 `otc_ac_float.h` 提供最小兼容接口以保持可编译与可测试性。
+
+> 若你的环境已安装完整 AC datatype，可将该兼容层替换为官方实现以获得一致的底层数据表示。

@@ -5,23 +5,6 @@
 #include "otc_fp.h"
 #include "otc_types.h"
 
-// ---------------------------
-// Batch payloads (FIFO flits)
-// ---------------------------
-struct BatchJob {
-    int batch_id = -1;
-    std::vector<uint32_t> raw_a;
-    std::vector<uint32_t> raw_b;
-    std::vector<uint32_t> raw_c;
-};
-
-struct BatchWork {
-    int batch_id = -1;
-    std::vector<double> a_f64;
-    std::vector<double> b_f64;
-    std::vector<double> c_f64;
-};
-
 struct BatchResult {
     int batch_id = -1;
     std::vector<double> d_f64;
@@ -77,8 +60,6 @@ public:
     State state_ = IDLE;
     uint64_t cycle_ = 0;
 
-    std::deque<BatchJob> input_fifo_;
-    std::deque<BatchWork> format_fifo_;
     std::deque<BatchResult> output_fifo_;
 
     struct ActiveBatch {
@@ -103,8 +84,7 @@ public:
     void load(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, const std::vector<uint32_t>& c);
     bool enqueue_job(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, const std::vector<uint32_t>& c);
     void start();
-    void do_format_conversion_stage();
-    bool load_active_from_format();
+    bool try_start_batch(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, const std::vector<uint32_t>& c);
     void dispatch_some(OTC_Stats& stats);
     void collect_results();
     bool push_output_result(const BatchResult& br);

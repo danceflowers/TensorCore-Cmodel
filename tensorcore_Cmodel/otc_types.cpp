@@ -20,7 +20,7 @@ bool OTC_Config::validate() const {
     return M > 0 && K > 0 && N > 0 && (K & (K - 1)) == 0 &&
            (type_ab == TYPE_FP4 || type_ab == TYPE_FP8 || type_ab == TYPE_FP16) &&
            (type_cd == TYPE_FP8 || type_cd == TYPE_FP16 || type_cd == TYPE_FP32) &&
-           dispatch_width > 0 && input_fifo_depth > 0 && output_fifo_depth > 0 &&
+           dispatch_width > 0 && output_fifo_depth > 0 &&
            mem_bandwidth_bytes_per_cycle > 0;
 }
 
@@ -31,7 +31,6 @@ void OTC_Stats::print(std::ostream& os) const {
     os << "Stall cycles:             " << stall_cycles << std::endl;
     os << "Format active cycles:     " << format_active_cycles << std::endl;
     os << "Dispatch active cycles:   " << dispatch_active_cycles << std::endl;
-    os << "Input FIFO stall cycles:  " << input_fifo_stall_cycles << std::endl;
     os << "Output backpressure cyc:  " << output_backpressure_cycles << std::endl;
     os << "Output FIFO max occ:      " << output_fifo_max_occupancy << std::endl;
     os << "MUL operations:           " << mul_ops << std::endl;

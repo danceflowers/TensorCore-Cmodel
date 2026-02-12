@@ -99,10 +99,12 @@ std::vector<uint32_t> test_pack_c_fp16(const std::vector<double>& vals) {
     return words;
 }
 
+double quantize_output_ref(double v, int type_cd, int type_cd_sub);
+
 // Quantized golden: same precision path as simulator
 std::vector<double> quantized_golden(const std::vector<double>& a, const std::vector<double>& b,
                                       const std::vector<double>& c, int M, int K, int N,
-                                      int type_ab, int sub) {
+                                      int type_ab, int sub, int type_cd, int type_cd_sub) {
     auto pa = test_pack_ab(a, type_ab, sub);
     auto pb = test_pack_ab(b, type_ab, sub);
     auto pc = test_pack_c_fp16(c);
@@ -126,28 +128,39 @@ std::vector<double> quantized_golden(const std::vector<double>& a, const std::ve
         cq[i] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(c16));
     }
 
+    // Golden path is aligned to the current simulator datapath implementation:
+    //   1) A/B are quantized by pack+unpack above (aq/bq)
+    //   2) dot-product accumulation is performed in host high precision
+    //   3) C participates as fp22-quantized input (cq)
+    //   4) final output is quantized by configured output type
     std::vector<double> d(M * N, 0.0);
-    for (int i = 0; i < M; i++)
+    for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
-            std::vector<double> tree(K);
+            double dot = 0.0;
             for (int k = 0; k < K; k++) {
-                double p9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(aq[i * K + k] * bq[k * N + j]));
-                tree[k] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(p9));
+                dot += aq[i * K + k] * bq[k * N + j];
             }
-
-            int n = K;
-            while (n > 1) {
-                for (int x = 0; x < n / 2; x++) {
-                    double s13 = tree[2 * x] + tree[2 * x + 1];
-                    tree[x] = SoftFloat::fp13_to_f64(SoftFloat::f64_to_fp13(s13));
-                }
-                n /= 2;
-            }
-
-            double dot9 = SoftFloat::fp9_to_f64(SoftFloat::f64_to_fp9(tree[0]));
-            d[i * N + j] = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot9 + cq[i * N + j]));
+            double acc_fp22 = SoftFloat::fp22_to_f64(SoftFloat::f64_to_fp22(dot + cq[i * N + j]));
+            d[i * N + j] = quantize_output_ref(acc_fp22, type_cd, type_cd_sub);
         }
+    }
     return d;
+}
+
+
+
+double quantize_output_ref(double v, int type_cd, int type_cd_sub) {
+    if (type_cd == TYPE_FP32) {
+        return SoftFloat::fp32_to_f64(SoftFloat::f64_to_fp32(v));
+    }
+    if (type_cd == TYPE_FP16) {
+        return SoftFloat::fp16_to_f64(SoftFloat::f64_to_fp16(v));
+    }
+    if (type_cd == TYPE_FP8) {
+        uint8_t fp8 = (type_cd_sub == SUB_FP8E4M3) ? FPConvert::f64_to_fp8e4m3(v) : FPConvert::f64_to_fp8e5m2(v);
+        return (type_cd_sub == SUB_FP8E4M3) ? FPConvert::fp8e4m3_to_f64(fp8) : FPConvert::fp8e5m2_to_f64(fp8);
+    }
+    return v;
 }
 
 std::vector<double> fp32_golden(const std::vector<double>& a, const std::vector<double>& b, const std::vector<double>& c,
@@ -176,19 +189,19 @@ void print_matrix(const char* tag, const std::vector<double>& m, int R, int C) {
 
 // Run a single GEMM test, return TestResult
 TestResult run_one_test(const std::string& name, int M, int K, int N,
-                         int type_ab, int sub, int type_cd,
+                         int type_ab, int sub, int type_cd, int type_cd_sub,
                          const std::vector<double>& a, const std::vector<double>& b,
-                         const std::vector<double>& c, double rtol, double atol) {
+                         const std::vector<double>& c, double rtol, double atol, bool dump_matrix = false) {
     OTC_Config cfg;
     cfg.M = M; cfg.K = K; cfg.N = N;
-    cfg.type_ab = type_ab; cfg.type_ab_sub = sub; cfg.type_cd = type_cd;
+    cfg.type_ab = type_ab; cfg.type_ab_sub = sub; cfg.type_cd = type_cd; cfg.type_cd_sub = type_cd_sub;
     cfg.debug_level = 0;
 
     auto pa = test_pack_ab(a, type_ab, sub);
     auto pb = test_pack_ab(b, type_ab, sub);
     auto pc = test_pack_c_fp16(c);
 
-    auto gold_q = quantized_golden(a, b, c, M, K, N, type_ab, sub);
+    auto gold_q = quantized_golden(a, b, c, M, K, N, type_ab, sub, type_cd, type_cd_sub);
 
     OTC_Device* dev;
     otc_dev_open(&dev);
@@ -210,11 +223,12 @@ TestResult run_one_test(const std::string& name, int M, int K, int N,
     otc_dev_close(dev);
 
     std::vector<double> gold_fp32;
-    if (M == 8 && K == 8 && N == 8) {
+    if ((M == 8 && K == 8 && N == 8) || dump_matrix) {
         gold_fp32 = fp32_golden(a, b, c, M, K, N);
         printf("\n  [Matrix dump] %s\n", name.c_str());
         print_matrix("  Result matrix:", result, M, N);
         print_matrix("  Golden matrix (fp32):", gold_fp32, M, N);
+        print_matrix("  Golden matrix (quantized output):", gold_q, M, N);
     }
 
     tr.pass = true; tr.max_err = 0; tr.avg_err = 0; tr.mismatches = 0;
@@ -302,7 +316,7 @@ void test_ones_suite() {
             auto a = gen_const(M * K, 1.0);
             auto b = gen_const(K * N, 1.0);
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
     }
 }
@@ -318,7 +332,7 @@ void test_identity_suite() {
             auto a = gen_identity(M, K);
             auto b = gen_identity(K, N);
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
     }
 }
@@ -337,7 +351,7 @@ void test_random_suite() {
                 auto a = gen_rand(M * K, seed, -1.0, 1.0);
                 auto b = gen_rand(K * N, seed + 100, -1.0, 1.0);
                 auto c = gen_rand(M * N, seed + 200, -0.5, 0.5);
-                report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+                report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
             }
         }
     }
@@ -354,7 +368,7 @@ void test_small_ints_suite() {
             auto a = gen_small_ints(M * K, 77);
             auto b = gen_small_ints(K * N, 88);
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
     }
 }
@@ -370,7 +384,7 @@ void test_with_bias_c_suite() {
             auto a = gen_const(M * K, 0.5);
             auto b = gen_const(K * N, 0.5);
             auto c = gen_const(M * N, 1.0);  // D = K*0.25 + 1.0
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
     }
 }
@@ -384,14 +398,14 @@ void test_edge_values_suite() {
             auto a = gen_zeros(M * K);
             auto b = gen_zeros(K * N);
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
         {   // Negative ones
             std::string name = std::string("negones_") + ts.name;
             auto a = gen_const(M * K, -1.0);
             auto b = gen_const(K * N, 1.0);
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
         {   // Mixed sign
             std::string name = std::string("mixsign_") + ts.name;
@@ -399,10 +413,40 @@ void test_edge_values_suite() {
             for (int i = 0; i < M * K; i++) a[i] = (i % 2 == 0) ? 1.0 : -1.0;
             for (int i = 0; i < K * N; i++) b[i] = (i % 3 == 0) ? -0.5 : 0.5;
             auto c = gen_zeros(M * N);
-            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, a, b, c, ts.rtol, ts.atol));
+            report(run_one_test(name, M, K, N, ts.type_ab, ts.sub, TYPE_FP32, SUB_FP8E5M2, a, b, c, ts.rtol, ts.atol));
         }
     }
 }
+
+
+void test_precision_cross_suite() {
+    printf("\n=== Suite: 8x8x8 random cross precision AB->CD (multi-run) ===\n");
+
+    struct OutSpec { const char* name; int type_cd; int sub_cd; double rtol; double atol; };
+    const OutSpec out_specs[] = {
+        {"fp8e5m2", TYPE_FP8, SUB_FP8E5M2, 0.10, 0.20},
+        {"fp8e4m3", TYPE_FP8, SUB_FP8E4M3, 0.25, 1.20},
+        {"fp16", TYPE_FP16, SUB_FP8E5M2, 0.05, 0.02},
+        {"fp32", TYPE_FP32, SUB_FP8E5M2, 0.05, 0.02},
+    };
+
+    const unsigned seeds[] = {11, 29, 47, 71, 97, 123, 211, 307};
+    const int M = 8, K = 8, N = 8;
+
+    for (const auto& in : ALL_TYPES) {
+        for (const auto& out : out_specs) {
+            for (unsigned seed : seeds) {
+                auto a = gen_rand(M * K, seed, -1.0, 1.0);
+                auto b = gen_rand(K * N, seed + 1000, -1.0, 1.0);
+                auto c = gen_rand(M * N, seed + 2000, -0.5, 0.5);
+                std::string name = std::string("cross_") + in.name + "_to_" + out.name + "_s" + std::to_string(seed);
+                report(run_one_test(name, M, K, N, in.type_ab, in.sub, out.type_cd, out.sub_cd,
+                                    a, b, c, out.rtol, out.atol, true));
+            }
+        }
+    }
+}
+
 
 // ============================================================================
 // Decode framework unit tests
@@ -622,6 +666,7 @@ int main() {
     test_small_ints_suite();
     test_with_bias_c_suite();
     test_edge_values_suite();
+    test_precision_cross_suite();
 
     printf("\n╔══════════════════════════════════════════════════════════════╗\n");
     printf("║   SUMMARY                                                  ║\n");
