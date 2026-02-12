@@ -54,6 +54,11 @@ make test-all           # 所有测试 (7 个用例)
 | `--test=` | `ones`, `identity`, `random`, `simple` | `ones` |
 | `--debug=N` | 调试级别 0-3 | 0 |
 | `--trace` | 写入 otc_run.log | off |
+| `--batches=N` | 多 batch 提交数量 | 1 |
+| `--dispatch_width=N` | 每周期下发 DP 数 | 8 |
+| `--out_fifo_depth=N` | 输出 FIFO 深度 | 8 |
+| `--mem_bw=N` | 峰值带宽（B/cycle）用于带宽利用率估算 | 32 |
+| `--random_runs=N` | random 测试重复次数 | 5 |
 
 ## 流水线延迟模型
 
@@ -70,3 +75,42 @@ FP4 ones 8×8×8  PASSED ✓  (13 cyc)
 FP16 ones 8×8×8 PASSED ✓  (13 cyc)
 16×16×16        PASSED ✓  (15 cyc, 4096 MULs)
 ```
+
+
+## 多 Batch Cycle-Stepping 与性能指标
+
+当前模型支持通过 `otc_submit` 连续提交多个 batch，并在 `tick()` 中逐周期推进：
+
+- 输入请求不再通过 FIFO 缓存，核心空闲时直接接收 batch。
+- 格式转换阶段与计算阶段并行推进（cycle-stepping）。
+- 输出队列：`output_fifo_depth` 可配置，支持背压统计。
+- 新增统计项：
+  - 吞吐率：`Throughput (batch/cycle)`
+  - 平均延迟：`Avg latency (cycles)`
+  - 带宽利用率：`BW utilization`
+  - 计算单元利用率：`Compute util`
+  - FIFO 相关：`Output FIFO max occ`、`Output backpressure cyc`
+
+示例：
+
+```bash
+./otc_simx --test=ones --batches=8 --dispatch_width=16 --out_fifo_depth=16 --mem_bw=64
+```
+
+
+## 主控制循环（Fetch/Decode/Execute）
+
+`main.cpp` 现在通过 `OTC_Decoder` 驱动简单指令序列，按 **Fetch -> Decode -> Execute** 执行：
+
+- `TCU_LOAD`：准备输入数据
+- `TCU_WMMA`：通过 `otc_driver` 提交多 batch 并执行
+- `TCU_STORE`：从输出 FIFO 弹出结果
+
+这样实现了将 tensor core 计算模块封装在 `otc_driver` 内，并与 `otc_decode` 在主循环中集成。
+
+
+## 构建依赖说明
+
+当前代码路径使用 `ac_std_float` 风格 API 描述精度转换边界；在缺少完整 AC datatype 依赖（如 `ac_float.h`）的环境下，工程通过 `otc_ac_float.h` 提供最小兼容接口以保持可编译与可测试性。
+
+> 若你的环境已安装完整 AC datatype，可将该兼容层替换为官方实现以获得一致的底层数据表示。
