@@ -62,8 +62,8 @@ int otc_download_f64(OTC_Device* dev, double* dst, int n) {
 int otc_pop_result_f64(OTC_Device* dev, double* dst, int n) {
     BatchResult br;
     if (!dev->tc.pop_output_result(br)) return 0;
-    int cnt = std::min(n, (int)br.d.size());
-    memcpy(dst, br.d.data(), cnt * sizeof(double));
+    int cnt = std::min(n, (int)br.d_f64.size());
+    memcpy(dst, br.d_f64.data(), cnt * sizeof(double));
     return cnt;
 }
 

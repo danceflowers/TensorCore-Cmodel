@@ -145,7 +145,6 @@ double fp8e4m3_to_f64(uint8_t fp8) {
     return (s ? -1 : 1) * ldexp(sig, exp);
 }
 
-
 uint8_t f64_to_fp8e5m2(double v) {
     uint16_t fp9 = SoftFloat::f64_to_fp9(v);
     int s9 = (fp9 >> 8) & 1;
@@ -165,17 +164,16 @@ uint8_t f64_to_fp8e4m3(double v) {
     frac *= 2.0;
     exp--;
     int be = exp + 7;
-    int m = 0;
 
     if (be >= 15) {
         return (uint8_t)((s << 7) | (0x0E << 3) | 0x07);
     }
     if (be <= 0) {
-        m = (int)(av / ldexp(1.0, -9) + 0.5) & 0x07;
+        int m = (int)(av / ldexp(1.0, -9) + 0.5) & 0x07;
         return (uint8_t)((s << 7) | m);
     }
 
-    m = (int)((frac - 1.0) * 8.0 + 0.5) & 0x07;
+    int m = (int)((frac - 1.0) * 8.0 + 0.5) & 0x07;
     return (uint8_t)((s << 7) | (be << 3) | m);
 }
 

@@ -1,54 +1,62 @@
 #pragma once
 #include <deque>
+
+#include "otc_ac_float.h"
 #include "otc_fp.h"
 #include "otc_types.h"
 
+// ---------------------------
+// Batch payloads (FIFO flits)
+// ---------------------------
 struct BatchJob {
-    int id = -1;
+    int batch_id = -1;
     std::vector<uint32_t> raw_a;
     std::vector<uint32_t> raw_b;
     std::vector<uint32_t> raw_c;
 };
 
 struct BatchWork {
-    int id = -1;
-    std::vector<double> conv_a;
-    std::vector<double> conv_b;
-    std::vector<double> conv_c;
+    int batch_id = -1;
+    std::vector<double> a_f64;
+    std::vector<double> b_f64;
+    std::vector<double> c_f64;
 };
 
 struct BatchResult {
-    int id = -1;
-    std::vector<double> d;
+    int batch_id = -1;
+    std::vector<double> d_f64;
     uint64_t start_cycle = 0;
     uint64_t done_cycle = 0;
 };
 
+// Per-dot-product input/output packet.
 struct DPInput {
-    std::vector<double> a;
-    std::vector<double> b;
-    double c;
-    int row, col;
+    std::vector<double> a_f64;
+    std::vector<double> b_f64;
+    double c_f64;
+    int row;
+    int col;
 };
 
 struct DPResult {
-    double value;
-    int row, col;
+    double value_f64;
+    int row;
+    int col;
 };
 
 class DotProductUnit {
 public:
     const OTC_Config* cfg_ = nullptr;
-    int total_latency_ = 0;
+    int latency_total_ = 0;
 
-    struct InFlight {
+    struct PipeEntry {
         DPResult result;
-        int remaining;
-        bool valid;
+        int latency_countdown;
+        bool entry_valid;
     };
 
-    std::vector<InFlight> pipe_;
-    DPResult output_;
+    std::vector<PipeEntry> pipe_q_;
+    DPResult output_data_;
     bool output_valid_ = false;
 
     void init(const OTC_Config* cfg);
@@ -74,19 +82,19 @@ public:
     std::deque<BatchResult> output_fifo_;
 
     struct ActiveBatch {
-        bool valid = false;
-        int id = -1;
-        std::vector<double> conv_a;
-        std::vector<double> conv_b;
-        std::vector<double> conv_c;
-        std::vector<double> output_d;
-        int dispatch_idx = 0;
+        bool batch_valid = false;
+        int batch_id = -1;
+        std::vector<double> a_f64;
+        std::vector<double> b_f64;
+        std::vector<double> c_f64;
+        std::vector<double> d_f64;
+        int dispatch_ptr = 0;
         int results_collected = 0;
         uint64_t start_cycle = 0;
-    } active_;
+    } active_batch_;
 
     int next_batch_id_ = 0;
-    int total_dp_busy_ = 0;
+    int dp_busy_acc_cycles_ = 0;
 
     std::vector<double> last_output_d_;
 
