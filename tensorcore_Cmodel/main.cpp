@@ -150,7 +150,11 @@ static std::vector<double> golden_model_quantized_from_packed(const std::vector<
         uint16_t h = (w >> (ei * 16)) & 0xFFFF;
         cq22[i] = SoftFloat::f64_to_fp22(SoftFloat::fp16_to_f64(h));
     }
+}
 
+
+static std::vector<double> golden_model_quantized(const std::vector<double>& aq, const std::vector<double>& bq,
+                                                  const std::vector<double>& cq, const OTC_Config& cfg) {
     std::vector<double> d(cfg.M * cfg.N, 0.0);
     for (int i = 0; i < cfg.M; i++) {
         for (int j = 0; j < cfg.N; j++) {
