@@ -456,7 +456,7 @@ inline FAddS1Out fadd_s1(uint32_t a_bits, uint32_t b_bits, int EXPWIDTH, int PRE
     out.far_sig  = fpo.result_sig;
 
     // Near path (two instances, select based on swap)
-    bool near_exp_neq = ((raw_a_exp & 3) != (raw_b_exp & 3));
+    bool near_exp_neq = (raw_a_exp != raw_b_exp);
 
     NearPathOut np0 = near_path_compute(a_sign, raw_a_exp, raw_a_sig,
                                          b_sign, raw_b_sig, near_exp_neq,
@@ -579,6 +579,14 @@ inline uint16_t fp9_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
     return (uint16_t)(result & 0x1FF);
 }
 
+// FP13 addition (E5M7, 13-bit) for higher-precision intermediate accumulation
+inline uint16_t fp13_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
+    uint32_t a_padded = ((uint32_t)a << 8);
+    uint32_t b_padded = ((uint32_t)b << 8);
+    uint32_t result = fp_add(a_padded, b_padded, 5, 16, 8, rm);
+    return (uint16_t)(result & 0x1FFF);
+}
+
 // FP22 addition (EXPWIDTH=8, PRECISION=14, OUTPC=14 for accumulator)
 // Final add in tc_dot_product: EXPWIDTH=8, PRECISION=14, LATENCY=2
 // tc_add_pipe pads: s1_in_a = {a_reg, {PRECISION{1'b0}}} = {22-bit, 14 zeros} = 36 bits
@@ -586,19 +594,6 @@ inline uint16_t fp9_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
 inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
     uint64_t a_padded = ((uint64_t)a << 14);
     uint64_t b_padded = ((uint64_t)b << 14);
-    // Need wider math for PRECISION=28 — use 64-bit version
-    // For simplicity, implement inline with same logic
-    // fadd with EXPWIDTH=8, PRECISION=28, OUTPC=14
-    // But our functions use uint32_t which is too narrow for 36-bit inputs
-    // Let's compute directly using double-precision integer math
-
-    // Actually, let's handle this specially since PRECISION=28 needs >32 bits
-    // We'll use the fp_add path but need to handle wider types
-    // For now, use the parameterized approach with 64-bit math
-
-    // Pack into 36-bit format: sign(1) + exp(8) + mant(27)
-    // a_padded and b_padded are 36-bit values
-    // We implement fadd directly here for 64-bit support
 
     auto extract = [](uint64_t bits, int EW, int P) -> FPUnpacked {
         FPUnpacked r;
@@ -621,7 +616,6 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
     auto ua = extract(a_padded, EW, P);
     auto ub = extract(b_padded, EW, P);
 
-    // Use the generic fadd logic
     FAddS1Out s1 = {};
     s1.rm = rm;
 
@@ -642,13 +636,11 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
     int ea_minus_eb = need_swap ? -exp_diff : exp_diff;
     s1.sel_far_path = !eff_sub || (ea_minus_eb > 1);
 
-    // Far path
     bool far_a_sign    = need_swap ? ub.sign : ua.sign;
     int  far_a_exp     = need_swap ? raw_b_exp : raw_a_exp;
     uint64_t far_a_sig = need_swap ? ub.sig : ua.sig;
     uint64_t far_b_sig = need_swap ? ua.sig : ub.sig;
 
-    // Far path inline for 64-bit
     {
         uint64_t b_shifted = 0;
         bool sticky = false;
@@ -673,7 +665,6 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
         }
         s1.far_sign = far_a_sign;
         s1.far_exp  = small_add_v ? 0 : fa_exp;
-        // Extract top OUTPC_val+2 bits + sticky
         int shift = P - OUTPC_val - 2;
         uint64_t top_sig;
         bool xsticky;
@@ -687,9 +678,8 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
         s1.far_sig = ((top_sig & ((1u << (OUTPC_val + 2)) - 1)) << 1) | ((sticky || xsticky) ? 1 : 0);
     }
 
-    // Near path
     {
-        bool near_exp_neq = ((raw_a_exp & 3) != (raw_b_exp & 3));
+        bool near_exp_neq = (raw_a_exp != raw_b_exp);
         auto do_near = [&](bool as, int ae, uint64_t asig, bool bs, uint64_t bsig) -> NearPathOut {
             NearPathOut out;
             uint64_t b_aligned = near_exp_neq ? (bsig >> 1) : bsig;
@@ -712,7 +702,7 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
         };
         NearPathOut np0 = do_near(ua.sign, raw_a_exp, ua.sig, ub.sign, ub.sig);
         NearPathOut np1 = do_near(ub.sign, raw_b_exp, ub.sig, ua.sign, ua.sig);
-        bool near_exp_neq_v = ((raw_a_exp & 3) != (raw_b_exp & 3));
+        bool near_exp_neq_v = (raw_a_exp != raw_b_exp);
         bool near_sel = need_swap || (!near_exp_neq_v && np0.a_lt_b);
         s1.near_sign = near_sel ? np1.result_sign : np0.result_sign;
         s1.near_exp  = near_sel ? (int)np1.result_exp : (int)np0.result_exp;
@@ -720,6 +710,5 @@ inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
         s1.near_sig_is_zero = near_sel ? np1.sig_is_zero : np0.sig_is_zero;
     }
 
-    // fadd_s2 for OUTPC=14
-    return fadd_s2(s1, EW, OUTPC_val) & 0x3FFFFF; // 22 bits
+    return fadd_s2(s1, EW, OUTPC_val) & 0x3FFFFF;
 }
