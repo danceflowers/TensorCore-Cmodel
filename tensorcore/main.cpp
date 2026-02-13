@@ -14,6 +14,7 @@
 //   ./tensorcore_sim --help                   Show usage
 // =============================================================================
 #include "tensor_core_sim.h"
+#include "tensor_core_cfg.h"
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -27,6 +28,7 @@
 // =============================================================================
 struct Config {
     std::vector<PrecisionType> precisions;
+    std::vector<PrecisionType> out_precisions;
     int  test_id    = 0;       // 0 = all, 1-6 = specific test
     RoundingMode rm = RNE;
     uint32_t seed   = 0;       // 0 = use time
@@ -58,6 +60,22 @@ struct MatrixSet {
     uint32_t b_raw[8][8];
     uint32_t c_raw[8][8];
 };
+
+double raw_to_double(uint32_t bits, PrecisionType prec) {
+    switch (prec) {
+        case PREC_FP4_E2M1: return fp4_to_double((uint8_t)(bits & 0xF));
+        case PREC_FP8_E4M3: return fp8_e4m3_to_double((uint8_t)(bits & 0xFF));
+        case PREC_FP8_E5M2: return fp8_e5m2_to_double((uint8_t)(bits & 0xFF));
+        case PREC_FP16:     return fp16_to_double((uint16_t)(bits & 0xFFFF));
+        case PREC_FP32: {
+            float f = 0.0f;
+            uint32_t raw = bits;
+            std::memcpy(&f, &raw, sizeof(float));
+            return (double)f;
+        }
+        default: return 0.0;
+    }
+}
 
 MatrixSet generate_random_matrices(PrecisionType prec) {
     MatrixSet ms = {};
@@ -126,8 +144,53 @@ const char* prec_name(PrecisionType p) {
         case PREC_FP8_E4M3: return "FP8_E4M3";
         case PREC_FP8_E5M2: return "FP8_E5M2";
         case PREC_FP16:     return "FP16";
+        case PREC_FP32:     return "FP32";
         default:            return "UNKNOWN";
     }
+}
+
+void print_matrix_fp22(const char* title, const uint32_t m[8][8]) {
+    printf("    %s\n", title);
+    for (int i = 0; i < 8; i++) {
+        printf("      ");
+        for (int j = 0; j < 8; j++) {
+            printf("%9.4f ", fp22_to_double(m[i][j]));
+        }
+        printf("\n");
+    }
+}
+
+void print_matrix_output(const char* title, const uint32_t m[8][8], PrecisionType out_prec) {
+    printf("    %s\n", title);
+    for (int i = 0; i < 8; i++) {
+        printf("      ");
+        for (int j = 0; j < 8; j++) {
+            printf("%9.4f ", output_bits_to_double(m[i][j], out_prec));
+        }
+        printf("\n");
+    }
+}
+
+void golden_fp32_matmul(const MatrixSet& ms, PrecisionType in_prec, double out[8][8]) {
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            float acc = 0.0f;
+            for (int k = 0; k < 8; k++) {
+                float a = (float)raw_to_double(ms.a_raw[i][k], in_prec);
+                float b = (float)raw_to_double(ms.b_raw[k][j], in_prec);
+                acc += a * b;
+            }
+            float c = (float)raw_to_double(ms.c_raw[i][j], in_prec);
+            out[i][j] = (double)(acc + c);
+        }
+    }
+}
+
+void quantized_golden_from_fp22(const uint32_t golden_fp22[8][8], PrecisionType out_prec, RoundingMode rm,
+                                uint32_t out_bits[8][8]) {
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            out_bits[i][j] = convert_fp22_to_output_bits(golden_fp22[i][j], out_prec, rm);
 }
 
 const char* rm_name(RoundingMode rm) {
@@ -160,6 +223,9 @@ void test_single_matmul() {
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 
     for (auto prec : g_cfg.precisions) {
+        for (auto out_prec : g_cfg.out_precisions) {
+            if (!(out_prec == PREC_FP8_E4M3 || out_prec == PREC_FP8_E5M2 || out_prec == PREC_FP16 || out_prec == PREC_FP32))
+                continue;
         MatrixSet ms = generate_random_matrices(prec);
 
         uint32_t ref[8][8];
@@ -167,29 +233,50 @@ void test_single_matmul() {
 
         TensorCoreSim sim;
         sim.reset();
-        sim.load_inputs(ms.a_fp9, ms.b_fp9, ms.c_fp22, prec, g_cfg.rm);
+        TensorCoreCfg cfg;
+        cfg.input_prec = prec;
+        cfg.output_prec = out_prec;
+        cfg.rm = g_cfg.rm;
+        sim.load_inputs(ms.a_fp9, ms.b_fp9, ms.c_fp22, cfg);
         int cycles = sim.run_to_completion();
+
+        uint32_t q_golden[8][8];
+        quantized_golden_from_fp22(ref, out_prec, g_cfg.rm, q_golden);
+
+        double fp32_golden[8][8];
+        golden_fp32_matmul(ms, prec, fp32_golden);
 
         int mismatches = 0;
         for (int i = 0; i < 8; i++)
             for (int j = 0; j < 8; j++)
-                if (!compare_fp22(sim.d_fp22[i][j], ref[i][j]))
+                if (sim.d_out[i][j] != q_golden[i][j])
                     mismatches++;
 
-        printf("  %-10s: %2d cycles latency | %s\n",
-               prec_name(prec), cycles,
+        printf("  In %-10s -> Out %-8s: %2d cycles latency | %s\n",
+               prec_name(prec), prec_name(out_prec), cycles,
                mismatches == 0 ? "✓ Bit-exact match (64/64 elements)" :
                                  "✗ MISMATCH");
+
+        print_matrix_output("Result Matrix", sim.d_out, out_prec);
+        print_matrix_output("Golden Matrix (Quantized)", q_golden, out_prec);
+        printf("    Golden Matrix (Unquantized FP32)\n");
+        for (int i = 0; i < 8; i++) {
+            printf("      ");
+            for (int j = 0; j < 8; j++) printf("%9.4f ", fp32_golden[i][j]);
+            printf("\n");
+        }
 
         if (mismatches > 0) {
             printf("    Mismatched elements:\n");
             for (int i = 0; i < 8; i++)
                 for (int j = 0; j < 8; j++)
-                    if (!compare_fp22(sim.d_fp22[i][j], ref[i][j]))
-                        printf("      [%d][%d]: pipe=0x%06X ref=0x%06X (%.6f vs %.6f)\n",
-                               i, j, sim.d_fp22[i][j], ref[i][j],
-                               fp22_to_double(sim.d_fp22[i][j]),
-                               fp22_to_double(ref[i][j]));
+                    if (sim.d_out[i][j] != q_golden[i][j])
+                        printf("      [%d][%d]: out=0x%08X qgold=0x%08X (%.6f vs %.6f, fp32=%.6f)\n",
+                               i, j, sim.d_out[i][j], q_golden[i][j],
+                               output_bits_to_double(sim.d_out[i][j], out_prec),
+                               output_bits_to_double(q_golden[i][j], out_prec),
+                               fp32_golden[i][j]);
+        }
         }
     }
     printf("\n");
@@ -265,54 +352,62 @@ void test_pipelined_throughput() {
 // =============================================================================
 void test_stress() {
     printf("╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║  Test 3: Stress Test (20 random matrices per precision)    ║\n");
+    printf("║  Test 3: Stress Test (100 random matrices per precision)   ║\n");
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 
-    int tests_per_prec = 20;
+    int tests_per_prec = 100;
 
     for (auto prec : g_cfg.precisions) {
-        int pass = 0, fail = 0;
-        double max_rel_err_vs_fp64 = 0;
-        int total_cycles = 0;
+        for (auto out_prec : g_cfg.out_precisions) {
+            if (!(out_prec == PREC_FP8_E4M3 || out_prec == PREC_FP8_E5M2 || out_prec == PREC_FP16 || out_prec == PREC_FP32))
+                continue;
+            int pass = 0, fail = 0;
+            double max_rel_err_vs_fp32 = 0;
+            int total_cycles = 0;
 
-        for (int t = 0; t < tests_per_prec; t++) {
-            MatrixSet ms = generate_random_matrices(prec);
-            uint32_t ref[8][8];
-            reference_matmul(ms.a_fp9, ms.b_fp9, ms.c_fp22, ref, g_cfg.rm);
+            for (int t = 0; t < tests_per_prec; t++) {
+                MatrixSet ms = generate_random_matrices(prec);
+                uint32_t ref[8][8];
+                reference_matmul(ms.a_fp9, ms.b_fp9, ms.c_fp22, ref, g_cfg.rm);
+                uint32_t q_golden[8][8];
+                quantized_golden_from_fp22(ref, out_prec, g_cfg.rm, q_golden);
+                double fp32_golden[8][8];
+                golden_fp32_matmul(ms, prec, fp32_golden);
 
-            TensorCoreSim sim;
-            sim.reset();
-            sim.load_inputs(ms.a_fp9, ms.b_fp9, ms.c_fp22, prec, g_cfg.rm);
-            int cycles = sim.run_to_completion();
-            total_cycles += cycles;
+                TensorCoreSim sim;
+                sim.reset();
+                TensorCoreCfg cfg;
+                cfg.input_prec = prec;
+                cfg.output_prec = out_prec;
+                cfg.rm = g_cfg.rm;
+                sim.load_inputs(ms.a_fp9, ms.b_fp9, ms.c_fp22, cfg);
+                int cycles = sim.run_to_completion();
+                total_cycles += cycles;
 
-            bool match = true;
-            for (int i = 0; i < 8 && match; i++)
-                for (int j = 0; j < 8 && match; j++)
-                    if (!compare_fp22(sim.d_fp22[i][j], ref[i][j]))
-                        match = false;
+                bool match = true;
+                for (int i = 0; i < 8 && match; i++)
+                    for (int j = 0; j < 8 && match; j++)
+                        if (sim.d_out[i][j] != q_golden[i][j])
+                            match = false;
 
-            if (match) pass++; else fail++;
+                if (match) pass++; else fail++;
 
-            for (int i = 0; i < 8; i++) {
-                for (int j = 0; j < 8; j++) {
-                    double fp64_sum = 0;
-                    for (int k = 0; k < 8; k++)
-                        fp64_sum += fp9_to_double(ms.a_fp9[i][k]) * fp9_to_double(ms.b_fp9[k][j]);
-                    double fp64_c = fp22_to_double(ms.c_fp22[i][j]);
-                    double expected = fp64_sum + fp64_c;
-                    double actual = fp22_to_double(sim.d_fp22[i][j]);
-                    if (expected != 0 && !std::isnan(expected) && !std::isinf(expected)) {
-                        double rel = fabs(actual - expected) / fabs(expected);
-                        if (rel > max_rel_err_vs_fp64) max_rel_err_vs_fp64 = rel;
+                for (int i = 0; i < 8; i++) {
+                    for (int j = 0; j < 8; j++) {
+                        double expected = fp32_golden[i][j];
+                        double actual = output_bits_to_double(sim.d_out[i][j], out_prec);
+                        if (expected != 0 && !std::isnan(expected) && !std::isinf(expected)) {
+                            double rel = fabs(actual - expected) / fabs(expected);
+                            if (rel > max_rel_err_vs_fp32) max_rel_err_vs_fp32 = rel;
+                        }
                     }
                 }
             }
-        }
 
-        printf("  %-10s: %d/%d bit-exact ✓ | avg %.1f cyc/matmul | max rel err vs FP64: %.2e\n",
-               prec_name(prec), pass, tests_per_prec,
-               total_cycles / (double)tests_per_prec, max_rel_err_vs_fp64);
+            printf("  In %-10s -> Out %-8s: %d/%d bit-exact ✓ | avg %.1f cyc/matmul | max rel err vs FP32: %.2e\n",
+                   prec_name(prec), prec_name(out_prec), pass, tests_per_prec,
+                   total_cycles / (double)tests_per_prec, max_rel_err_vs_fp32);
+        }
     }
     printf("\n");
 }
@@ -540,6 +635,12 @@ void print_config() {
         printf("%s", prec_name(g_cfg.precisions[i]));
     }
     printf("\n");
+    printf("    Out Prec   : ");
+    for (size_t i = 0; i < g_cfg.out_precisions.size(); i++) {
+        if (i > 0) printf(", ");
+        printf("%s", prec_name(g_cfg.out_precisions[i]));
+    }
+    printf("\n");
     printf("    Rounding   : %s\n", rm_name(g_cfg.rm));
     printf("    RNG seed   : %u\n", rng_state);
     if (g_cfg.test_id == 0)
@@ -560,6 +661,9 @@ void print_usage(const char* prog) {
     printf("    --prec <PRECISION>   Restrict to a single precision format\n");
     printf("                         Values: FP4_E2M1 | FP8_E4M3 | FP8_E5M2 | FP16\n");
     printf("                         Default: all precisions\n\n");
+    printf("    --out-prec <PREC>    Restrict output precision format\n");
+    printf("                         Values: FP8_E4M3 | FP8_E5M2 | FP16 | FP32\n");
+    printf("                         Default: all supported output precisions\n\n");
     printf("    --test <ID>          Run only a specific test (1-6)\n");
     printf("                         1 = Single matmul per precision\n");
     printf("                         2 = Back-to-back pipelined matmuls\n");
@@ -578,6 +682,7 @@ void print_usage(const char* prog) {
     printf("    %s                            Run all tests, all precisions\n", prog);
     printf("    %s --prec FP8_E4M3            Test FP8 E4M3 only\n", prog);
     printf("    %s --test 3 --prec FP16       Stress test FP16 only\n", prog);
+    printf("    %s --prec FP16 --out-prec FP32  FP16 input, FP32 output\n", prog);
     printf("    %s --rm RTZ --seed 42         Fixed seed, round-toward-zero\n", prog);
     printf("\n");
 }
@@ -590,8 +695,9 @@ PrecisionType parse_precision(const char* s) {
     if (strcmp(s, "FP8_E4M3") == 0 || strcmp(s, "E4M3") == 0)    return PREC_FP8_E4M3;
     if (strcmp(s, "FP8_E5M2") == 0 || strcmp(s, "E5M2") == 0)    return PREC_FP8_E5M2;
     if (strcmp(s, "FP16") == 0)                                    return PREC_FP16;
+    if (strcmp(s, "FP32") == 0)                                    return PREC_FP32;
     fprintf(stderr, "  Error: Unknown precision '%s'\n", s);
-    fprintf(stderr, "  Valid: FP4_E2M1 | FP8_E4M3 | FP8_E5M2 | FP16\n\n");
+    fprintf(stderr, "  Valid: FP4_E2M1 | FP8_E4M3 | FP8_E5M2 | FP16 | FP32\n\n");
     exit(1);
 }
 
@@ -608,6 +714,7 @@ RoundingMode parse_rounding(const char* s) {
 
 bool parse_args(int argc, char* argv[]) {
     g_cfg.precisions.clear();
+    g_cfg.out_precisions.clear();
     g_cfg.test_id  = 0;
     g_cfg.rm       = RNE;
     g_cfg.seed     = 0;
@@ -619,6 +726,8 @@ bool parse_args(int argc, char* argv[]) {
             return true;
         } else if (strcmp(argv[i], "--prec") == 0 && i + 1 < argc) {
             g_cfg.precisions.push_back(parse_precision(argv[++i]));
+        } else if (strcmp(argv[i], "--out-prec") == 0 && i + 1 < argc) {
+            g_cfg.out_precisions.push_back(parse_precision(argv[++i]));
         } else if (strcmp(argv[i], "--test") == 0 && i + 1 < argc) {
             g_cfg.test_id = atoi(argv[++i]);
             if (g_cfg.test_id < 1 || g_cfg.test_id > 6) {
@@ -637,6 +746,9 @@ bool parse_args(int argc, char* argv[]) {
 
     if (g_cfg.precisions.empty()) {
         g_cfg.precisions = {PREC_FP4_E2M1, PREC_FP8_E4M3, PREC_FP8_E5M2, PREC_FP16};
+    }
+    if (g_cfg.out_precisions.empty()) {
+        g_cfg.out_precisions = {PREC_FP8_E4M3, PREC_FP8_E5M2, PREC_FP16, PREC_FP32};
     }
 
     return true;
