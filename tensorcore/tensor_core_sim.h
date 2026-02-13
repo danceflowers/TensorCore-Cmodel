@@ -259,6 +259,11 @@ struct TensorCoreSim {
                 tick_dot_product(i, j);
             }
         }
+
+        // A/B/C for one GEMM are launched once, then the pipeline drains.
+        // Keeping input_loaded=true would keep re-injecting the same K terms
+        // whenever a mul slot becomes free, corrupting the dot-product sum.
+        input_loaded = false;
     }
 
 private:
@@ -449,33 +454,16 @@ inline void reference_matmul(const uint16_t a_fp9[8][8], const uint16_t b_fp9[8]
                               RoundingMode rm = RNE)
 {
     (void)rm;
-    double temp_a, temp_b, temp_c;
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            // Step 1: 8 multiplications
-            double products[8];
+            double acc = 0.0;
             for (int k = 0; k < 8; k++) {
-                temp_a = fp9_to_double(a_fp9[i][k]);
-                temp_b = fp9_to_double(b_fp9[k][j]);
-                products[k] = temp_a * temp_b;
+                double a = fp9_to_double(a_fp9[i][k]);
+                double b = fp9_to_double(b_fp9[k][j]);
+                acc += a * b;
             }
-
-            // Step 2: Adder tree Level 0 (pairs: 0+4, 1+5, 2+6, 3+7)
-            double sums_l0[4];
-            for (int a = 0; a < 4; a++) {
-                sums_l0[a] = products[a]+ products[a + 4];
-            }
-
-            // Step 3: Adder tree Level 1
-            double sums_l1[2];
-            // sums_l1[0] = fp9_add(sums_l0[0], sums_l0[1], rm);
-            // sums_l1[1] = fp9_add(sums_l0[2], sums_l0[3], rm);
-            sums_l1[0]=sums_l0[0] + sums_l0[1];
-            sums_l1[1]=sums_l0[2] + sums_l0[3];
-            // Step 4: Adder tree Level 2
-            double sum_l2 = sums_l1[0] + sums_l1[1];
-            temp_c = fp22_to_double(c_fp22[i][j]) + sum_l2;
-            d_fp[i][j] = temp_c;
+            d_fp[i][j] = acc + fp22_to_double(c_fp22[i][j]);
         }
     }
 }
+
