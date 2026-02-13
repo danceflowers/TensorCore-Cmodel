@@ -351,30 +351,30 @@ inline uint16_t convert_to_fp9(uint32_t raw_bits, PrecisionType prec) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  FP9 / FP12 widening helpers for accumulation tree
+//  FP9 / FP13 widening helpers for accumulation tree
 // ─────────────────────────────────────────────────────────────
-inline uint16_t fp9_to_fp12(uint16_t fp9) {
+inline uint16_t fp9_to_fp13(uint16_t fp9) {
     bool s = (fp9 >> 8) & 1;
     int  e = (fp9 >> 3) & 0x1F;
     int  m = fp9 & 0x7;
-    return (uint16_t)((s << 11) | (e << 6) | (m << 3));
+    return (uint16_t)((s << 12) | (e << 7) | (m << 4));
 }
 
-inline uint32_t fp12_to_fp22(uint16_t fp12) {
-    bool s = (fp12 >> 11) & 1;
-    int  e = (fp12 >> 6) & 0x1F;
-    int  m = fp12 & 0x3F;
+inline uint32_t fp13_to_fp22(uint16_t fp13) {
+    bool s = (fp13 >> 12) & 1;
+    int  e = (fp13 >> 7) & 0x1F;
+    int  m = fp13 & 0x7F;
     if (e == 0 && m == 0) return (s << 21);
     if (e == 0x1F) {
         return (s << 21) | (0xFF << 13) | (m ? 0x1000 : 0);
     }
     if (e == 0) {
-        int lz = clz(m, 6);
+        int lz = clz(m, 7);
         int ne = -14 - lz + 127;
-        if (ne <= 0) return (s << 21) | ((m << (7 + 1 + lz)) & 0x1FFF);
-        return (s << 21) | (ne << 13) | ((((m << (1 + lz)) & 0x3F) << 7) & 0x1FFF);
+        if (ne <= 0) return (s << 21) | ((m << (6 + 1 + lz)) & 0x1FFF);
+        return (s << 21) | (ne << 13) | ((((m << (1 + lz)) & 0x7F) << 6) & 0x1FFF);
     }
-    return (s << 21) | ((e + 112) << 13) | ((m << 7) & 0x1FFF);
+    return (s << 21) | ((e + 112) << 13) | ((m << 6) & 0x1FFF);
 }
 
 // ─────────────────────────────────────────────────────────────

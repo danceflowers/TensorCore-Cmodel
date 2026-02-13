@@ -88,8 +88,8 @@ struct MulStage1Data {
     uint16_t  b_bits;
 };
 
-struct FP12Token {
-    uint16_t value;  // packed FP12 (E5M6)
+struct FP13Token {
+    uint16_t value;  // packed FP13 (E5M7)
 };
 
 struct FP22Token {
@@ -104,14 +104,14 @@ struct DotProductPipeline {
     // Multiplier pipelines (8 parallel)
     PipeStage2<MulStage1Data> mul_pipe[8];
     // Multiplication products (held between mul output and add tree input)
-    uint16_t mul_results[8]; // FP12 intermediates
+    uint16_t mul_results[8]; // FP13 intermediates
     bool     mul_results_valid[8];
 
     // Adder tree: Level 0 (4 adders), Level 1 (2 adders), Level 2 (1 adder)
     // Each is a 2-stage pipeline
-    PipeStage2<FP12Token> add_L0[4]; // pairs: (0,4),(1,5),(2,6),(3,7)
-    PipeStage2<FP12Token> add_L1[2]; // pairs: (L0[0],L0[1]), (L0[2],L0[3])
-    PipeStage2<FP12Token> add_L2;    // pair: (L1[0],L1[1])
+    PipeStage2<FP13Token> add_L0[4]; // pairs: (0,4),(1,5),(2,6),(3,7)
+    PipeStage2<FP13Token> add_L1[2]; // pairs: (L0[0],L0[1]), (L0[2],L0[3])
+    PipeStage2<FP13Token> add_L2;    // pair: (L1[0],L1[1])
 
     // Final FP22 add (tree result + bias C)
     PipeStage2<FP22Token> final_add;
@@ -294,7 +294,7 @@ private:
             bool final_in_valid = p.add_L2.out_valid() && !p.final_add_input_valid;
             if (final_in_valid && !p.final_add_input_valid) {
                 // Convert FP9 tree result to FP22
-                p.final_add_a = fp12_to_fp22(p.add_L2.out_data().value);
+                p.final_add_a = fp13_to_fp22(p.add_L2.out_data().value);
                 p.final_add_b = c_fp22[i][j];
                 p.final_add_input_valid = true;
             }
@@ -331,11 +331,11 @@ private:
                 p.add_L2_input_valid = true;
             }
 
-            FP12Token l2_in = {p.add_L2_a};
+            FP13Token l2_in = {p.add_L2_a};
             p.add_L2.tick(p.add_L2_input_valid, l2_in, l2_out_ready,
-                [](const FP12Token& in) -> FP12Token { return in; },
-                [&](const FP12Token& in) -> FP12Token {
-                    return {fp12_add(in.value, p.add_L2_b, cfg.rm)};
+                [](const FP13Token& in) -> FP13Token { return in; },
+                [&](const FP13Token& in) -> FP13Token {
+                    return {fp13_add(in.value, p.add_L2_b, cfg.rm)};
                 });
 
             if (p.add_L2.in_ready(l2_out_ready) && p.add_L2_input_valid) {
@@ -359,11 +359,11 @@ private:
                 p.add_L1_input_valid[a] = true;
             }
 
-            FP12Token l1_in = {p.add_L1_a[a]};
+            FP13Token l1_in = {p.add_L1_a[a]};
             p.add_L1[a].tick(p.add_L1_input_valid[a], l1_in, l1_out_ready[a],
-                [](const FP12Token& in) -> FP12Token { return in; },
-                [&, a](const FP12Token& in) -> FP12Token {
-                    return {fp12_add(in.value, p.add_L1_b[a], cfg.rm)};
+                [](const FP13Token& in) -> FP13Token { return in; },
+                [&, a](const FP13Token& in) -> FP13Token {
+                    return {fp13_add(in.value, p.add_L1_b[a], cfg.rm)};
                 });
 
             if (p.add_L1[a].in_ready(l1_out_ready[a]) && p.add_L1_input_valid[a]) {
@@ -390,11 +390,11 @@ private:
                 p.add_L0_input_valid[a] = true;
             }
 
-            FP12Token l0_in = {p.add_L0_a[a]};
+            FP13Token l0_in = {p.add_L0_a[a]};
             p.add_L0[a].tick(p.add_L0_input_valid[a], l0_in, l0_out_ready[a],
-                [](const FP12Token& in) -> FP12Token { return in; },
-                [&, a](const FP12Token& in) -> FP12Token {
-                    return {fp12_add(in.value, p.add_L0_b[a], cfg.rm)};
+                [](const FP13Token& in) -> FP13Token { return in; },
+                [&, a](const FP13Token& in) -> FP13Token {
+                    return {fp13_add(in.value, p.add_L0_b[a], cfg.rm)};
                 });
 
             if (p.add_L0[a].in_ready(l0_out_ready[a]) && p.add_L0_input_valid[a]) {
@@ -439,7 +439,7 @@ private:
 
             // Capture multiplier output
             if (p.mul_pipe[k].out_valid() && !p.mul_results_valid[k]) {
-                p.mul_results[k] = fp9_to_fp12((uint16_t)(p.mul_pipe[k].out_data().s1.shift_amt & 0x1FF));
+                p.mul_results[k] = fp9_to_fp13((uint16_t)(p.mul_pipe[k].out_data().s1.shift_amt & 0x1FF));
                 p.mul_results_valid[k] = true;
             }
         }

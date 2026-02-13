@@ -579,12 +579,12 @@ inline uint16_t fp9_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
     return (uint16_t)(result & 0x1FF);
 }
 
-// FP12 addition (E5M6, 12-bit) for higher-precision intermediate accumulation
-inline uint16_t fp12_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
-    uint32_t a_padded = ((uint32_t)a << 7);
-    uint32_t b_padded = ((uint32_t)b << 7);
-    uint32_t result = fp_add(a_padded, b_padded, 5, 14, 7, rm);
-    return (uint16_t)(result & 0xFFF);
+// FP13 addition (E5M7, 13-bit) for higher-precision intermediate accumulation
+inline uint16_t fp13_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
+    uint32_t a_padded = ((uint32_t)a << 8);
+    uint32_t b_padded = ((uint32_t)b << 8);
+    uint32_t result = fp_add(a_padded, b_padded, 5, 16, 8, rm);
+    return (uint16_t)(result & 0x1FFF);
 }
 
 // FP22 addition (EXPWIDTH=8, PRECISION=14, OUTPC=14 for accumulator)
