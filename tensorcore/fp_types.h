@@ -195,26 +195,6 @@ inline double fp4_to_double(uint8_t v) {
 
 // Double → format (approximate, for test data generation)
 
-inline uint16_t double_to_fp9(double val) {
-    if (std::isnan(val)) return (0x1F << 3) | 0x4;
-    if (std::isinf(val)) return (val < 0 ? 0x100 : 0) | (0x1F << 3);
-    if (val == 0.0) return std::signbit(val) ? 0x100 : 0;
-    bool s = val < 0; val = fabs(val);
-    int e; double m = frexp(val, &e); e--; m *= 2;
-    int b = e + 15;
-    if (b >= 31) return (s << 8) | (0x1F << 3);
-    if (b <= 0) {
-        int sh = 1 - b;
-        if (sh > 4) return (s << 8);
-        int sig = (int)(m * 8.0);
-        int o = (sig >> sh);
-        return (s << 8) | (o & 0x7);
-    }
-    int mt = (int)((m - 1.0) * 8 + 0.5);
-    if (mt >= 8) { mt = 0; b++; }
-    if (b >= 31) return (s << 8) | (0x1F << 3);
-    return (s << 8) | (b << 3) | (mt & 0x7);
-}
 
 inline uint16_t double_to_fp16(double val) {
     if (std::isnan(val)) return 0x7E00;
@@ -368,6 +348,33 @@ inline uint16_t convert_to_fp9(uint32_t raw_bits, PrecisionType prec) {
         case PREC_FP16:     return fp16_to_fp9(raw_bits & 0xFFFF);
         default: return 0;
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FP9 / FP12 widening helpers for accumulation tree
+// ─────────────────────────────────────────────────────────────
+inline uint16_t fp9_to_fp12(uint16_t fp9) {
+    bool s = (fp9 >> 8) & 1;
+    int  e = (fp9 >> 3) & 0x1F;
+    int  m = fp9 & 0x7;
+    return (uint16_t)((s << 11) | (e << 6) | (m << 3));
+}
+
+inline uint32_t fp12_to_fp22(uint16_t fp12) {
+    bool s = (fp12 >> 11) & 1;
+    int  e = (fp12 >> 6) & 0x1F;
+    int  m = fp12 & 0x3F;
+    if (e == 0 && m == 0) return (s << 21);
+    if (e == 0x1F) {
+        return (s << 21) | (0xFF << 13) | (m ? 0x1000 : 0);
+    }
+    if (e == 0) {
+        int lz = clz(m, 6);
+        int ne = -14 - lz + 127;
+        if (ne <= 0) return (s << 21) | ((m << (7 + 1 + lz)) & 0x1FFF);
+        return (s << 21) | (ne << 13) | ((((m << (1 + lz)) & 0x3F) << 7) & 0x1FFF);
+    }
+    return (s << 21) | ((e + 112) << 13) | ((m << 7) & 0x1FFF);
 }
 
 // ─────────────────────────────────────────────────────────────
