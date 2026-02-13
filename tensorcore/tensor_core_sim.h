@@ -8,6 +8,7 @@
 // =============================================================================
 #include "fp_types.h"
 #include "fp_arith.h"
+#include "tensor_core_cfg.h"
 #include <array>
 #include <vector>
 #include <functional>
@@ -118,6 +119,7 @@ struct DotProductPipeline {
     // Output conversion register
     bool   conv_valid = false;
     uint32_t conv_fp22 = 0;
+    uint32_t conv_out_bits = 0;
 
     // Sideband: C bias and rounding mode propagated through pipeline
     // In RTL these are ctrl registers at each stage
@@ -147,7 +149,7 @@ struct DotProductPipeline {
 
     // Returns output valid and result (FP8/FP16/FP32 depending on output_prec)
     bool out_valid() const { return conv_valid; }
-    uint32_t out_result() const { return conv_fp22; }
+    uint32_t out_result() const { return conv_out_bits; }
 };
 
 // =============================================================================
@@ -162,9 +164,7 @@ struct TensorCoreSim {
     DotProductPipeline dp[M][N];
 
     // Configuration
-    PrecisionType input_prec  = PREC_FP8_E4M3;
-    PrecisionType output_prec = PREC_FP8_E4M3;
-    RoundingMode  rm          = RNE;
+    TensorCoreCfg cfg;
 
     // Input data (all K elements arrive simultaneously)
     uint16_t a_fp9[M][K];  // A matrix in FP9
@@ -173,6 +173,7 @@ struct TensorCoreSim {
 
     // Output
     uint32_t d_fp22[M][N]; // Raw FP22 results
+    uint32_t d_out[M][N];  // Final output bits (FP8/FP16/FP32)
     bool     d_valid[M][N];
 
     // Pipeline state
@@ -198,11 +199,9 @@ struct TensorCoreSim {
 
     // Load input matrices (already converted to FP9/FP22)
     void load_inputs(const uint16_t a[M][K], const uint16_t b[K][N],
-                     const uint32_t c[M][N], PrecisionType prec, RoundingMode r = RNE)
+                     const uint32_t c[M][N], const TensorCoreCfg& in_cfg)
     {
-        input_prec = prec;
-        output_prec = prec;
-        rm = r;
+        cfg = in_cfg;
         for (int i = 0; i < M; i++)
             for (int k = 0; k < K; k++)
                 a_fp9[i][k] = a[i][k];
@@ -212,9 +211,19 @@ struct TensorCoreSim {
         for (int i = 0; i < M; i++)
             for (int j = 0; j < N; j++) {
                 c_fp22[i][j] = c[i][j];
+                d_out[i][j] = 0;
                 d_valid[i][j] = false;
             }
         input_loaded = true;
+    }
+
+    void load_inputs(const uint16_t a[M][K], const uint16_t b[K][N],
+                     const uint32_t c[M][N], PrecisionType prec, RoundingMode r = RNE) {
+        TensorCoreCfg in_cfg;
+        in_cfg.input_prec = prec;
+        in_cfg.output_prec = prec;
+        in_cfg.rm = r;
+        load_inputs(a, b, c, in_cfg);
     }
 
     // Run the full pipeline until all outputs are valid
@@ -255,8 +264,8 @@ struct TensorCoreSim {
 private:
     void tick_dot_product(int i, int j) {
         auto& p = dp[i][j];
-        p.rm = rm;
-        p.output_prec = output_prec;
+        p.rm = cfg.rm;
+        p.output_prec = cfg.output_prec;
 
         // ============================================================
         // Stage 11: Output conversion (FP22 → output format)
@@ -265,7 +274,9 @@ private:
         if (p.final_add.out_valid() && !p.conv_valid) {
             p.conv_valid = true;
             p.conv_fp22 = p.final_add.out_data().value;
+            p.conv_out_bits = convert_fp22_to_output_bits(p.conv_fp22, p.output_prec, p.rm);
             d_fp22[i][j] = p.conv_fp22;
+            d_out[i][j] = p.conv_out_bits;
             d_valid[i][j] = true;
         }
 
@@ -293,7 +304,7 @@ private:
                 },
                 // Stage 2: full FP22 add
                 [&](const FP22Token& in) -> FP22Token {
-                    uint32_t result = fp22_add(in.value, p.final_add_b, rm);
+                    uint32_t result = fp22_add(in.value, p.final_add_b, cfg.rm);
                     return {result};
                 });
 
@@ -319,7 +330,7 @@ private:
             p.add_L2.tick(p.add_L2_input_valid, l2_in, l2_out_ready,
                 [](const FP9Token& in) -> FP9Token { return in; },
                 [&](const FP9Token& in) -> FP9Token {
-                    return {fp9_add(in.value, p.add_L2_b, rm)};
+                    return {fp9_add(in.value, p.add_L2_b, cfg.rm)};
                 });
 
             if (p.add_L2.in_ready(l2_out_ready) && p.add_L2_input_valid) {
@@ -347,7 +358,7 @@ private:
             p.add_L1[a].tick(p.add_L1_input_valid[a], l1_in, l1_out_ready[a],
                 [](const FP9Token& in) -> FP9Token { return in; },
                 [&, a](const FP9Token& in) -> FP9Token {
-                    return {fp9_add(in.value, p.add_L1_b[a], rm)};
+                    return {fp9_add(in.value, p.add_L1_b[a], cfg.rm)};
                 });
 
             if (p.add_L1[a].in_ready(l1_out_ready[a]) && p.add_L1_input_valid[a]) {
@@ -378,7 +389,7 @@ private:
             p.add_L0[a].tick(p.add_L0_input_valid[a], l0_in, l0_out_ready[a],
                 [](const FP9Token& in) -> FP9Token { return in; },
                 [&, a](const FP9Token& in) -> FP9Token {
-                    return {fp9_add(in.value, p.add_L0_b[a], rm)};
+                    return {fp9_add(in.value, p.add_L0_b[a], cfg.rm)};
                 });
 
             if (p.add_L0[a].in_ready(l0_out_ready[a]) && p.add_L0_input_valid[a]) {
@@ -403,7 +414,7 @@ private:
             MulStage1Data mul_in;
             mul_in.a_bits = a_fp9[i][k];
             mul_in.b_bits = b_fp9[k][j];
-            mul_in.s1 = fmul_s1(mul_in.a_bits, mul_in.b_bits, 5, 4, rm);
+            mul_in.s1 = fmul_s1(mul_in.a_bits, mul_in.b_bits, 5, 4, cfg.rm);
 
             p.mul_pipe[k].tick(mul_in_valid, mul_in, mul_out_ready,
                 // Stage 1: latch + s1 computation

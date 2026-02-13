@@ -33,8 +33,8 @@ DBGFLAGS  := -g -O0 -fsanitize=address,undefined -DDEBUG
 
 # Target
 TARGET    := tensorcore_sim
-SRCS      := main.cpp
-HDRS      := fp_types.h fp_arith.h tensor_core_sim.h
+SRCS      := main.cpp tensor_core_cfg.cpp
+HDRS      := fp_types.h fp_arith.h tensor_core_sim.h tensor_core_cfg.h
 
 # Configurable parameters (override on command line)
 PREC      ?= ALL
