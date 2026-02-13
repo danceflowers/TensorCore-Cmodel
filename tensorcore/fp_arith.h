@@ -456,7 +456,7 @@ inline FAddS1Out fadd_s1(uint32_t a_bits, uint32_t b_bits, int EXPWIDTH, int PRE
     out.far_sig  = fpo.result_sig;
 
     // Near path (two instances, select based on swap)
-    bool near_exp_neq = ((raw_a_exp & 3) != (raw_b_exp & 3));
+    bool near_exp_neq = (raw_a_exp != raw_b_exp);
 
     NearPathOut np0 = near_path_compute(a_sign, raw_a_exp, raw_a_sig,
                                          b_sign, raw_b_sig, near_exp_neq,
@@ -564,19 +564,18 @@ inline uint32_t fp_add(uint32_t a, uint32_t b, int EXPWIDTH, int PRECISION, int 
 // Convenience wrappers for FP9 (EXPWIDTH=5, PRECISION=4)
 // =============================================================================
 inline uint16_t fp9_multiply(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
-    return (uint16_t)fp_multiply(a, b, 5, 4, rm);
+    (void)rm;
+    double r = fp9_to_double(a) * fp9_to_double(b);
+    return double_to_fp9(r);
 }
 
 // FP9 addition (matches tc_add_pipe: inputs zero-padded to 2*PRECISION)
 // tc_add_pipe pads: s1_in_a = {a_reg, {PRECISION{1'b0}}} making PRECISION*2 mantissa
 // fadd_s1 called with PRECISION=2*PRECISION=8, OUTPC=PRECISION=4
 inline uint16_t fp9_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
-    // Zero-pad to EXPWIDTH + 2*PRECISION bits = 5 + 8 = 13 bits
-    uint32_t a_padded = ((uint32_t)a << 4) ; // {a[8:0], 0000}
-    uint32_t b_padded = ((uint32_t)b << 4) ;
-    // fadd with EXPWIDTH=5, PRECISION=8, OUTPC=4
-    uint32_t result = fp_add(a_padded, b_padded, 5, 8, 4, rm);
-    return (uint16_t)(result & 0x1FF);
+    (void)rm;
+    double r = fp9_to_double(a) + fp9_to_double(b);
+    return double_to_fp9(r);
 }
 
 // FP22 addition (EXPWIDTH=8, PRECISION=14, OUTPC=14 for accumulator)
@@ -584,142 +583,7 @@ inline uint16_t fp9_add(uint16_t a, uint16_t b, RoundingMode rm = RNE) {
 // tc_add_pipe pads: s1_in_a = {a_reg, {PRECISION{1'b0}}} = {22-bit, 14 zeros} = 36 bits
 // fadd_s1 with EXPWIDTH=8, PRECISION=28, OUTPC=14
 inline uint32_t fp22_add(uint32_t a, uint32_t b, RoundingMode rm = RNE) {
-    uint64_t a_padded = ((uint64_t)a << 14);
-    uint64_t b_padded = ((uint64_t)b << 14);
-    // Need wider math for PRECISION=28 — use 64-bit version
-    // For simplicity, implement inline with same logic
-    // fadd with EXPWIDTH=8, PRECISION=28, OUTPC=14
-    // But our functions use uint32_t which is too narrow for 36-bit inputs
-    // Let's compute directly using double-precision integer math
-
-    // Actually, let's handle this specially since PRECISION=28 needs >32 bits
-    // We'll use the fp_add path but need to handle wider types
-    // For now, use the parameterized approach with 64-bit math
-
-    // Pack into 36-bit format: sign(1) + exp(8) + mant(27)
-    // a_padded and b_padded are 36-bit values
-    // We implement fadd directly here for 64-bit support
-
-    auto extract = [](uint64_t bits, int EW, int P) -> FPUnpacked {
-        FPUnpacked r;
-        int total = 1 + EW + (P - 1);
-        r.sign = (bits >> (total - 1)) & 1;
-        r.exp  = (bits >> (P - 1)) & ((1u << EW) - 1);
-        uint32_t mant = bits & ((1ULL << (P - 1)) - 1);
-        r.exp_is_zero = (r.exp == 0);
-        r.exp_is_ones = (r.exp == ((1u << EW) - 1));
-        r.sig_is_zero = (mant == 0);
-        r.sig = (r.exp_is_zero ? 0 : (1ULL << (P - 1))) | mant;
-        r.is_inf  = r.exp_is_ones && r.sig_is_zero;
-        r.is_zero = r.exp_is_zero && r.sig_is_zero;
-        r.is_nan  = r.exp_is_ones && !r.sig_is_zero;
-        r.is_snan = r.is_nan && !((mant >> (P - 2)) & 1);
-        return r;
-    };
-
-    const int EW = 8, P = 28, OUTPC_val = 14;
-    auto ua = extract(a_padded, EW, P);
-    auto ub = extract(b_padded, EW, P);
-
-    // Use the generic fadd logic
-    FAddS1Out s1 = {};
-    s1.rm = rm;
-
-    bool eff_sub = ua.sign ^ ub.sign;
-    bool small_add_v = ua.exp_is_zero && ub.exp_is_zero;
-
-    int raw_a_exp = ua.exp | (ua.exp_is_zero ? 1 : 0);
-    int raw_b_exp = ub.exp | (ub.exp_is_zero ? 1 : 0);
-
-    s1.special_case_valid = ua.is_nan || ub.is_nan || ua.is_inf || ub.is_inf;
-    s1.special_case_nan = ua.is_nan || ub.is_nan || (ua.is_inf && ub.is_inf && eff_sub);
-    s1.special_case_iv  = ua.is_snan || ub.is_snan || (ua.is_inf && ub.is_inf && eff_sub);
-    s1.far_mul_of = ub.exp_is_ones && !eff_sub;
-    s1.small_add = small_add_v;
-
-    int exp_diff = raw_a_exp - raw_b_exp;
-    bool need_swap = (exp_diff < 0);
-    int ea_minus_eb = need_swap ? -exp_diff : exp_diff;
-    s1.sel_far_path = !eff_sub || (ea_minus_eb > 1);
-
-    // Far path
-    bool far_a_sign    = need_swap ? ub.sign : ua.sign;
-    int  far_a_exp     = need_swap ? raw_b_exp : raw_a_exp;
-    uint64_t far_a_sig = need_swap ? ub.sig : ua.sig;
-    uint64_t far_b_sig = need_swap ? ua.sig : ub.sig;
-
-    // Far path inline for 64-bit
-    {
-        uint64_t b_shifted = 0;
-        bool sticky = false;
-        if (ea_minus_eb < P + 3) {
-            uint64_t mask = (1ULL << ea_minus_eb) - 1;
-            sticky = (far_b_sig & mask) != 0;
-            b_shifted = far_b_sig >> ea_minus_eb;
-        } else {
-            sticky = (far_b_sig != 0);
-        }
-        int64_t sig_result;
-        int fa_exp = far_a_exp;
-        if (eff_sub) {
-            sig_result = (int64_t)far_a_sig - (int64_t)b_shifted;
-        } else {
-            sig_result = (int64_t)far_a_sig + (int64_t)b_shifted;
-            if ((sig_result >> P) & 1) {
-                sticky = sticky || (sig_result & 1);
-                sig_result >>= 1;
-                fa_exp += 1;
-            }
-        }
-        s1.far_sign = far_a_sign;
-        s1.far_exp  = small_add_v ? 0 : fa_exp;
-        // Extract top OUTPC_val+2 bits + sticky
-        int shift = P - OUTPC_val - 2;
-        uint64_t top_sig;
-        bool xsticky;
-        if (shift > 0) {
-            xsticky = (sig_result & ((1LL << shift) - 1)) != 0;
-            top_sig = sig_result >> shift;
-        } else {
-            xsticky = false;
-            top_sig = sig_result << (-shift);
-        }
-        s1.far_sig = ((top_sig & ((1u << (OUTPC_val + 2)) - 1)) << 1) | ((sticky || xsticky) ? 1 : 0);
-    }
-
-    // Near path
-    {
-        bool near_exp_neq = ((raw_a_exp & 3) != (raw_b_exp & 3));
-        auto do_near = [&](bool as, int ae, uint64_t asig, bool bs, uint64_t bsig) -> NearPathOut {
-            NearPathOut out;
-            uint64_t b_aligned = near_exp_neq ? (bsig >> 1) : bsig;
-            bool a_lt = (asig < b_aligned);
-            int64_t diff = a_lt ? (int64_t)(b_aligned - asig) : (int64_t)(asig - b_aligned);
-            out.result_sign = a_lt ? bs : as;
-            out.sig_is_zero = (diff == 0);
-            out.a_lt_b = a_lt;
-            int lzc_v = 0;
-            if (diff == 0) lzc_v = P + 1;
-            else { for (int i = P; i >= 0; i--) { if (diff & (1LL << i)) break; lzc_v++; } }
-            uint64_t normalized = (uint64_t)diff << lzc_v;
-            int exp_n = ae - lzc_v;
-            if (exp_n <= 0) exp_n = 0;
-            out.result_exp = exp_n;
-            int shift = P - OUTPC_val - 2;
-            out.result_sig = (shift > 0) ? (normalized >> shift) : (normalized << (-shift));
-            out.result_sig &= ((1u << (OUTPC_val + 3)) - 1);
-            return out;
-        };
-        NearPathOut np0 = do_near(ua.sign, raw_a_exp, ua.sig, ub.sign, ub.sig);
-        NearPathOut np1 = do_near(ub.sign, raw_b_exp, ub.sig, ua.sign, ua.sig);
-        bool near_exp_neq_v = ((raw_a_exp & 3) != (raw_b_exp & 3));
-        bool near_sel = need_swap || (!near_exp_neq_v && np0.a_lt_b);
-        s1.near_sign = near_sel ? np1.result_sign : np0.result_sign;
-        s1.near_exp  = near_sel ? (int)np1.result_exp : (int)np0.result_exp;
-        s1.near_sig  = near_sel ? np1.result_sig : np0.result_sig;
-        s1.near_sig_is_zero = near_sel ? np1.sig_is_zero : np0.sig_is_zero;
-    }
-
-    // fadd_s2 for OUTPC=14
-    return fadd_s2(s1, EW, OUTPC_val) & 0x3FFFFF; // 22 bits
+    (void)rm;
+    double r = fp22_to_double(a) + fp22_to_double(b);
+    return double_to_fp22(r);
 }

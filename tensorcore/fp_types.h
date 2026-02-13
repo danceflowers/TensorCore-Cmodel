@@ -194,6 +194,28 @@ inline double fp4_to_double(uint8_t v) {
 }
 
 // Double → format (approximate, for test data generation)
+
+inline uint16_t double_to_fp9(double val) {
+    if (std::isnan(val)) return (0x1F << 3) | 0x4;
+    if (std::isinf(val)) return (val < 0 ? 0x100 : 0) | (0x1F << 3);
+    if (val == 0.0) return std::signbit(val) ? 0x100 : 0;
+    bool s = val < 0; val = fabs(val);
+    int e; double m = frexp(val, &e); e--; m *= 2;
+    int b = e + 15;
+    if (b >= 31) return (s << 8) | (0x1F << 3);
+    if (b <= 0) {
+        int sh = 1 - b;
+        if (sh > 4) return (s << 8);
+        int sig = (int)(m * 8.0);
+        int o = (sig >> sh);
+        return (s << 8) | (o & 0x7);
+    }
+    int mt = (int)((m - 1.0) * 8 + 0.5);
+    if (mt >= 8) { mt = 0; b++; }
+    if (b >= 31) return (s << 8) | (0x1F << 3);
+    return (s << 8) | (b << 3) | (mt & 0x7);
+}
+
 inline uint16_t double_to_fp16(double val) {
     if (std::isnan(val)) return 0x7E00;
     if (std::isinf(val)) return val > 0 ? 0x7C00 : 0xFC00;
