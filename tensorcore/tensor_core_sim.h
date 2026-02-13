@@ -445,34 +445,36 @@ private:
 // Functional (non-pipelined) reference: compute D = A*B + C using same arithmetic
 // =============================================================================
 inline void reference_matmul(const uint16_t a_fp9[8][8], const uint16_t b_fp9[8][8],
-                              const uint32_t c_fp22[8][8], uint32_t d_fp22[8][8],
+                              const uint32_t c_fp22[8][8], double d_fp[8][8],
                               RoundingMode rm = RNE)
 {
+    double temp_a,temp_b,temp_c;
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
             // Step 1: 8 multiplications
             uint16_t products[8];
             for (int k = 0; k < 8; k++) {
-                products[k] = fp9_multiply(a_fp9[i][k], b_fp9[k][j], rm);
+                temp_a=fp9_to_double(a_fp9[i][k]);
+                temp_b=fp9_to_double(b_fp9[i][k]);
+                products[k] = temp_a*temp_b;
             }
 
             // Step 2: Adder tree Level 0 (pairs: 0+4, 1+5, 2+6, 3+7)
-            uint16_t sums_l0[4];
+            double sums_l0[4];
             for (int a = 0; a < 4; a++) {
-                sums_l0[a] = fp9_add(products[a], products[a + 4], rm);
+                sums_l0[a] = products[a]+ products[a + 4];
             }
 
             // Step 3: Adder tree Level 1
-            uint16_t sums_l1[2];
-            sums_l1[0] = fp9_add(sums_l0[0], sums_l0[1], rm);
-            sums_l1[1] = fp9_add(sums_l0[2], sums_l0[3], rm);
-
+            double sums_l1[2];
+            // sums_l1[0] = fp9_add(sums_l0[0], sums_l0[1], rm);
+            // sums_l1[1] = fp9_add(sums_l0[2], sums_l0[3], rm);
+            sums_l1[0]=sums_l0[0] + sums_l0[1];
+            sums_l1[1]=sums_l0[2] + sums_l0[3];
             // Step 4: Adder tree Level 2
-            uint16_t sum_l2 = fp9_add(sums_l1[0], sums_l1[1], rm);
-
-            // Step 5: Convert to FP22 and add C
-            uint32_t sum_fp22 = fp9_to_fp22(sum_l2);
-            d_fp22[i][j] = fp22_add(sum_fp22, c_fp22[i][j], rm);
+            double sum_l2 = sums_l1[0] + sums_l1[1];
+            temp_c=fp22_to_double(c_fp22[i][j])+sum_l2;
+            d_fp[i][j] = temp_c;
         }
     }
 }

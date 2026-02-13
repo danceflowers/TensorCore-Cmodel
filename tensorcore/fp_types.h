@@ -87,6 +87,77 @@ inline double fp22_to_double(uint32_t fp22) {
     return s ? -v : v;
 }
 
+inline uint32_t double_to_fp22(double v) {
+    // 1. 获取 double 的原始 64 位二进制
+    uint64_t u;
+    std::memcpy(&u, &v, sizeof(u)); 
+
+    // 2. 提取 double 的各部分
+    bool s    = (u >> 63) & 1;
+    int e_d   = (u >> 52) & 0x7FF;            // Double Exponent (Bias 1023)
+    uint64_t m_d = u & 0xFFFFFFFFFFFFF;       // Double Mantissa (52 bits)
+
+    // 3. 处理特殊情况：NaN 和 Infinity
+    if (e_d == 0x7FF) {
+        if (m_d != 0) return (s << 21) | (0xFF << 13) | 1; // NaN (保留符号，设置非零 payload)
+        return (s << 21) | (0xFF << 13);                   // Infinity
+    }
+
+    // 4. 处理零 (Zero)
+    if (e_d == 0) return s << 21; // Double 的非规格化数极小，在 FP22 中直接视为 0
+
+    // 5. 计算 FP22 的指数
+    // Double Bias = 1023, FP22 Bias = 127
+    int exp_unbiased = e_d - 1023;
+    int e_fp22 = exp_unbiased + 127;
+
+    // 6. 对齐尾数
+    // 加上隐含的 1 (1.xxxxx)，变成 53 位精度
+    uint64_t m_full = m_d | (1ULL << 52);
+
+    // Double 有 52 位小数，FP22 只有 13 位小数
+    // 标准右移量 = 52 - 13 = 39
+    uint32_t m_fp22;
+
+    // A. 处理上溢 (Overflow)
+    if (e_fp22 >= 255) return (s << 21) | (0xFF << 13); // 变成 Inf
+
+    // B. 处理下溢/非规格化数 (Subnormal)
+    if (e_fp22 <= 0) {
+        // 需要额外的右移来将指数拉回到 1 (编码为 0)
+        int shift = 39 + (1 - e_fp22);
+        
+        if (shift >= 64) return s << 21; // 太小了，变成 0
+        
+        // 舍入逻辑 (Round to Nearest)
+        uint64_t round_val = 1ULL << (shift - 1);
+        m_full += round_val;
+        
+        m_fp22 = m_full >> shift;
+        e_fp22 = 0; // 非规格化数指数编码为 0
+    } 
+    // C. 规格化数 (Normal)
+    else {
+        // 舍入逻辑：在将被丢弃的最高位(bit 38)加 1
+        m_full += (1ULL << 38);
+        
+        // 检查舍入是否导致进位 (例如 1.11...11 + 1 -> 10.00...00)
+        if (m_full & (1ULL << 53)) {
+            m_full >>= 1;
+            e_fp22++;
+        }
+        
+        // 再次检查舍入后的上溢
+        if (e_fp22 >= 255) return (s << 21) | (0xFF << 13);
+        
+        // 提取高 13 位 (丢弃 bit 0-38，保留 bit 39-51)
+        m_fp22 = (m_full >> 39) & 0x1FFF;
+    }
+
+    // 7. 组装结果
+    return (s << 21) | (e_fp22 << 13) | m_fp22;
+}
+
 inline double fp16_to_double(uint16_t fp16) {
     bool s = (fp16 >> 15) & 1;
     int e  = (fp16 >> 10) & 0x1F;
@@ -213,6 +284,40 @@ inline uint16_t fp8_e5m2_to_fp9(uint8_t fp8) {
     }
     return (s << 8) | (e << 3) | (m << 1); // same bias, extend mantissa
 }
+
+// // FP8(E5M2) -> FP22(E8M13)
+// // FP8 : S(1) E(5) M(2)  Bias=15
+// // FP22: S(1) E(8) M(13) Bias=127
+// inline uint32_t fp8_e5m2_to_fp22(uint8_t fp8) {
+//     bool s = (fp8 >> 7) & 1;     
+//     int e = (fp8 >> 2) & 0x1F;   
+//     int m = fp8 & 3;             
+//     if (e == 31) {
+//         if (m) return (s << 21) | (0xFF << 13) | (1 << 12); 
+//         return (s << 21) | (0xFF << 13);
+//     }
+//     // 2. 处理 0 和 非规格化数 (Subnormal)
+//     if (e == 0) {
+//         if (m == 0) return (s << 21); // 纯 0
+//         // FP8的非规格化数 (0.m * 2^-14) 在 FP22 (范围更大) 中会变成规格化数
+//         // 我们需要手动归一化 (Normalize)
+//         // Bias差值 = 127 - 15 = 112
+//         // FP8 Subnormal 实际指数权重为 1 - 15 = -14
+//         // m=1 (01b) -> 0.01 -> 1.0 * 2^-2. 实际指数 -14-2=-16. FP22指数 = -16+127 = 111
+//         if (m == 1) return (s << 21) | (111 << 13) | 0;
+        
+//         // m=2 (10b) -> 0.10 -> 1.0 * 2^-1. 实际指数 -14-1=-15. FP22指数 = -15+127 = 112
+//         if (m == 2) return (s << 21) | (112 << 13) | 0;
+        
+//         // m=3 (11b) -> 0.11 -> 1.1 * 2^-1. 实际指数 -14-1=-15. FP22指数 = 112, 尾数 1.1...
+//         // 这里的 1.1 对应 FP22 尾数最高位设为1 (即 1<<12)
+//         return (s << 21) | (112 << 13) | (1 << 12);
+//     }
+//     // 3. 处理规格化数 (Normal)
+//     // 指数需要加上 Bias 的差值 (127 - 15 = 112)
+//     // 尾数从 2位 扩展到 13位 (左移 11 位)
+//     return (s << 21) | ((e + 112) << 13) | (m << 11);
+// }
 
 inline uint16_t fp16_to_fp9(uint16_t fp16) {
     bool s = (fp16 >> 15) & 1; int e = (fp16 >> 10) & 0x1F; int m = fp16 & 0x3FF;
